@@ -29,7 +29,7 @@ metadata:
   labels:
     operatorframework.io/arch.amd64: supported
     operatorframework.io/arch.ppc64le: supported
-  name: simple-demo-operator.v0.0.7
+  name: 3simple-demo-operator.v0.0.7
   namespace: placeholder
 spec:
   apiservicedefinitions: {}
@@ -87,11 +87,11 @@ spec:
                 - subjectaccessreviews
               verbs:
                 - create
-          serviceAccountName: simple-demo-operator-controller-manager
+          serviceAccountName: 3simple-demo-operator-controller-manager
       deployments:
         - label:
             control-plane: controller-manager
-          name: simple-demo-operator-controller-manager
+          name: 3simple-demo-operator-controller-manager
           spec:
             replicas: 1
             selector:
@@ -153,7 +153,7 @@ spec:
                       allowPrivilegeEscalation: false
                 securityContext:
                   runAsNonRoot: true
-                serviceAccountName: simple-demo-operator-controller-manager
+                serviceAccountName: 3simple-demo-operator-controller-manager
                 terminationGracePeriodSeconds: 10
       permissions:
         - rules:
@@ -188,7 +188,7 @@ spec:
               verbs:
                 - create
                 - patch
-          serviceAccountName: simple-demo-operator-controller-manager
+          serviceAccountName: 3simple-demo-operator-controller-manager
     strategy: deployment
   installModes:
     - supported: true
