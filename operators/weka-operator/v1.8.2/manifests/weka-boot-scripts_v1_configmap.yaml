@@ -1,0 +1,1717 @@
+apiVersion: v1
+data:
+  devenv.sh: "#!/bin/bash\n# Create kernel development environment for COS\n\nset
+    -o errexit\nset -o pipefail\n\nROOT_MOUNT_DIR=\"${ROOT_MOUNT_DIR:-/root}\"\nRETRY_COUNT=${RETRY_COUNT:-5}\n\nreadonly
+    COS_CI_DOWNLOAD_GCS=\"gs://cos-infra-prod-artifacts-official\"\nreadonly TOOLCHAIN_URL_FILENAME=\"toolchain_path\"\nreadonly
+    KERNEL_HEADERS=\"kernel-headers.tgz\"\nreadonly KERNEL_HEADERS_DIR=\"kernel-headers\"\nreadonly
+    TOOLCHAIN_ARCHIVE_GCS=\"toolchain.tar.xz.gcs\"\nreadonly TOOLCHAIN_ENV_FILENAME=\"toolchain_env\"\nROOT_OS_RELEASE=\"${ROOT_MOUNT_DIR}/etc/os-release\"\nreadonly
+    RETCODE_ERROR=1\nRELEASE_ID=\"\"\n#\n# Individual build directory, contains kernel
+    headers for the specific build and\n# a symlink 'toolchain' that points to the
+    toolchain used for this particular\n# build\n#\nBUILD_DIR=\"\"\n\nKERNEL_CONFIGS=\"defconfig\"\nBUILD_DEBUG_PACKAGE=\"false\"\nBUILD_HEADERS_PACKAGE=\"false\"\nCLEAN_BEFORE_BUILD=\"false\"\n\nBOARD=\"\"\nBUILD_ID=\"\"\n\n#
+    official release, CI build, or cross-toolchain\nMODE=\"\"\n\nCROS_TC_VERSION=\"2021.06.26.094653\"\n#
+    Chromium OS toolchain bucket\nCROS_TC_DOWNLOAD_GCS=\"gs://chromiumos-sdk/\"\n#
+    COS toolchain bucket\nCOS_TC_DOWNLOAD_GCS=\"gs://cos-sdk/\"\n\n# Can be overridden
+    by the command-line argument\nTOOLCHAIN_ARCH=\"x86_64\"\nKERNEL_ARCH=\"x86_64\"\n\n#
+    CC and CXX will be set by set_compilation_env\nCC=\"\"\nCXX=\"\"\n\n# Use out-of-tree
+    build for full kernel build\nKBUILD_OUTPUT=\".\"\n\n_log() {\n  local -r prefix=\"$1\"\n
+    \ shift\n  echo \"[${prefix}$(date -u \"+%Y-%m-%d %H:%M:%S %Z\")] \"\"$*\" >&2\n}\n\ninfo()
+    {\n  _log \"INFO    \" \"$*\"\n}\n\nwarn() {\n  _log \"WARNING \" \"$*\"\n}\n\nerror()
+    {\n  _log \"ERROR   \" \"$*\"\n}\n\n#######################################\n#
+    Choose the public GCS bucket of COS to fetch files from\n# \"cos-tools\", \"cos-tools-eu\"
+    and \"cos-tools-asia\"\n# based on where the VM is running.\n# Arguments:\n#   None\n#
+    Globals:\n#   COS_DOWNLOAD_GCS\n#######################################\nget_cos_tools_bucket()
+    {\n\t# Get the zone the VM is running in.\n\t# Example output: projects/438692578867/zones/us-west2-a\n\t#
+    If not running on GCE, use \"cos-tools\" by default.\n\tmetadata_zone=\"$(curl
+    -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/zone)\"
+    || {\n\t\treadonly COS_DOWNLOAD_GCS=\"gs://cos-tools\"\n\t\treturn\n\t}\n\tzone=\"$(
+    echo $metadata_zone | rev | cut -d '/' -f 1 | rev )\"\n\tprefix=\"$( echo $zone
+    | cut -d '-' -f 1 )\"\n\tcase $prefix in\n\t\t\"us\" | \"northamerica\" | \"southamerica\")\n\t\t\treadonly
+    COS_DOWNLOAD_GCS=\"gs://cos-tools\"\n\t\t\t;;\n\t\t\"europe\")\n\t\t\treadonly
+    COS_DOWNLOAD_GCS=\"gs://cos-tools-eu\"\n\t\t\t;;\n\t\t\"asia\" | \"australia\")\n\t\t\treadonly
+    COS_DOWNLOAD_GCS=\"gs://cos-tools-asia\"\n\t\t\t;;\n\t\t*)\n\t\t\treadonly COS_DOWNLOAD_GCS=\"gs://cos-tools\"\n\t\t\t;;\n\tesac\n}\n\ndownload_from_url()
+    {\n  local -r url=\"$1\"\n  local -r output=\"$2\"\n  info \"Downloading from
+    URL: ${url}\"\n  info \"Local download location: ${output}\"\n  local attempts=0\n
+    \ until curl --http1.1 -sfS \"${url}\" -o \"${output}\"; do\n    attempts=$((
+    attempts + 1))\n    if (( \"${attempts}\" >= \"${RETRY_COUNT}\" )); then\n      error
+    \"Could not download from ${url}\"\n      return ${RETCODE_ERROR}\n    fi\n    warn
+    \"Error downloading from ${url}, retrying\"\n    sleep 1\n  done\n  info \"Download
+    finished\"\n}\n\ndownload_from_gcs() {\n  local -r url=\"$1\"\n  local -r output=\"$2\"\n
+    \ info \"Downloading from Google Storage: ${url}\"\n  info \"Local download location:
+    ${output}\"\n  local attempts=0\n  until gsutil -q cp \"${url}\" \"${output}\";
+    do\n    attempts=$(( attempts + 1))\n    if (( \"${attempts}\" >= \"${RETRY_COUNT}\"
+    )); then\n      error \"Could not download from ${url}\"\n      return ${RETCODE_ERROR}\n
+    \   fi\n    warn \"Error downloading from ${url}, retrying\"\n    sleep 1\n  done\n
+    \ info \"Download finished\"\n}\n\n# Get the toolchain description in the form
+    of $toolchain-$version\n# For CrOS toolchain it's just a basename without extension
+    but for\n# COS toolchain version needs to be extarcted from the GCS bucket path\nget_toolchain_pkg_name()
+    {\n  local -r download_url=$1\n  case \"${download_url}\" in\n    *//cos-sdk/*)\n
+    \     local -r toolchain=\"$(basename -s .tar.xz \"${download_url}\")\"\n      local
+    -r path=\"$(echo \"${download_url}\" | sed 's@\\w\\+://cos-sdk/@@')\"\n      local
+    -r version=\"$(echo \"${path}\" | awk -F / '{print $1 \"-\" $2}')\"\n      echo
+    \"${toolchain}-${version}\"\n      ;;\n    *//chromiumos-sdk/*)\n      echo \"$(basename
+    -s .tar.xz \"${download_url}\")\"\n      ;;\n    *)\n      error \"Unknown toolchain
+    source: ${download_url}\"\n      exit ${RETCODE_ERROR}\n      ;;\n  esac\n}\n\ninstall_cross_toolchain_pkg()
+    {\n  local -r download_url=$1\n  local -r tmpdownload=\"$(mktemp -d)\"\n  local
+    -r archive_name=\"$(basename \"${download_url}\")\"\n  local -r pkg_name=\"$(get_toolchain_pkg_name
+    \"${download_url}\")\"\n  local -r toolchain_dir=\"/build/toolchains/${pkg_name}\"\n
+    \ if [[ ! -d \"${toolchain_dir}\" ]]; then\n    info \"Downloading prebuilt toolchain
+    from ${download_url}\"\n    download_from_gcs \"${download_url}\" \"${tmpdownload}/${archive_name}\"\n
+    \   # Don't unpack Rust toolchain elements because they are not needed and they\n
+    \   # use a lot of disk space.\n    mkdir -p \"${toolchain_dir}\"\n    info \"Unpacking
+    toolchain to ${toolchain_dir}\"\n    tar axf \"${tmpdownload}/${archive_name}\"
+    -C \"${toolchain_dir}\" \\\n      --exclude='./usr/lib64/rustlib*' \\\n      --exclude='./usr/lib64/libstd-*.so'
+    \\\n      --exclude='./lib/libstd-*.so' \\\n      --exclude='./lib/librustc*'
+    \\\n      --exclude='./usr/lib64/librustc*'\n    rm -rf \"${tmpdownload}\"\n    info
+    \"Toolchain installed\"\n  else\n    info \"Toolchain is already cached\"\n  fi\n\n
+    \ if [[ ! -L \"${BUILD_DIR}/toolchain\" ]]; then\n    ln -s \"${toolchain_dir}\"
+    \"${BUILD_DIR}/toolchain\"\n  fi\n\n  # keep toolchain source information\n  echo
+    -n \"${download_url}\" > \"${BUILD_DIR}/toolchain_url\"\n}\n\ninstall_release_cross_toolchain()
+    {\n  info \"Downloading and installing a toolchain\"\n  # Get toolchain_env path
+    from COS GCS bucket\n  local -r tc_env_file_path=\"${COS_DOWNLOAD_GCS}/${RELEASE_ID}/${TOOLCHAIN_ENV_FILENAME}\"\n
+    \ info \"Obtaining toolchain_env file from ${tc_env_file_path}\"\n\n  # Download
+    toolchain_env if present\n  if ! download_from_gcs \"${tc_env_file_path}\" \"${BUILD_DIR}/${TOOLCHAIN_ENV_FILENAME}\";
+    then\n    error \"Failed to download toolchain file\"\n    error \"Make sure build
+    id '$RELEASE_ID' is valid\"\n    return ${RETCODE_ERROR}\n  fi\n\n  # Download
+    .gcs file with the original location of the toolchain\n  # we need the version
+    to put it in cachable location\n  local -r tc_gcs_download_url=\"${COS_DOWNLOAD_GCS}/${RELEASE_ID}/${TOOLCHAIN_ARCHIVE_GCS}\"\n
+    \ if ! download_from_gcs \"${tc_gcs_download_url}\" \"${BUILD_DIR}/${TOOLCHAIN_ARCHIVE_GCS}\";
+    then\n    error \"Failed to download toolchain .gcs file\"\n    error \"Make sure
+    build id '$RELEASE_ID' is valid\"\n    return ${RETCODE_ERROR}\n  fi\n\n  local
+    -r bucket=$(cat \"${BUILD_DIR}/${TOOLCHAIN_ARCHIVE_GCS}\" | grep ^bucket: | cut
+    -d ' ' -f 2)\n  local -r path=$(cat \"${BUILD_DIR}/${TOOLCHAIN_ARCHIVE_GCS}\"
+    | grep ^path: | cut -d ' ' -f 2)\n  local -r tc_download_url=\"gs://$bucket/$path\"\n\n
+    \ # Install toolchain pkg\n  install_cross_toolchain_pkg \"${tc_download_url}\"\n}\n\ninstall_release_kernel_headers()
+    {\n  info \"Downloading and installing a kernel headers\"\n  local -r kernel_headers_file_path=\"${COS_DOWNLOAD_GCS}/${RELEASE_ID}/${KERNEL_HEADERS}\"\n
+    \ info \"Obtaining kernel headers file from ${kernel_headers_file_path}\"\n\n
+    \ if ! download_from_gcs \"${kernel_headers_file_path}\" \"${BUILD_DIR}/${KERNEL_HEADERS}\";
+    then\n        return ${RETCODE_ERROR}\n  fi\n  mkdir -p \"${BUILD_DIR}/${KERNEL_HEADERS_DIR}\"\n
+    \ tar axf \"${BUILD_DIR}/${KERNEL_HEADERS}\" -C \"${BUILD_DIR}/${KERNEL_HEADERS_DIR}\"\n
+    \ rm -f \"${BUILD_DIR}/${KERNEL_HEADERS}\"\n}\n\n# Download and install toolchain
+    from the CI or tryjob build directory\ninstall_build_cross_toolchain() {\n  local
+    -r bucket=\"$1\"\n\n  info \"Downloading and installing a toolchain\"\n  # Get
+    toolchain_env path from COS GCS bucket\n  local -r tc_env_file_path=\"${bucket}/${TOOLCHAIN_ENV_FILENAME}\"\n
+    \ local -r tc_url_file_path=\"${bucket}/${TOOLCHAIN_URL_FILENAME}\"\n\n  info
+    \"Obtaining toolchain_env file from ${tc_env_file_path}\"\n\n  # Download toolchain_env
+    if present\n  if ! download_from_gcs \"${tc_env_file_path}\" \"${BUILD_DIR}/${TOOLCHAIN_ENV_FILENAME}\";
+    then\n        error \"Failed to download toolchain file\"\n        error \"Make
+    sure build id '$RELEASE_ID' is valid\"\n        return ${RETCODE_ERROR}\n  fi\n\n
+    \ # Download toolchain_path if present\n  if ! download_from_gcs \"${tc_url_file_path}\"
+    \"${BUILD_DIR}/${TOOLCHAIN_URL_FILENAME}\"; then\n        error \"Failed to download
+    toolchain file\"\n        error \"Make sure build id '$RELEASE_ID' is valid\"\n
+    \       return ${RETCODE_ERROR}\n  fi\n\n  local -r tc_path=\"$(cat ${BUILD_DIR}/${TOOLCHAIN_URL_FILENAME})\"\n
+    \ local tc_download_url=\"${COS_TC_DOWNLOAD_GCS}${tc_path}\"\n  if ! gsutil -q
+    stat \"${tc_download_url}\"; then\n    tc_download_url=\"${CROS_TC_DOWNLOAD_GCS}${tc_path}\"\n
+    \ fi\n\n  if ! gsutil -q stat \"${tc_download_url}\"; then\n        error \"Toolchain
+    path '${tc_path}' does not exist in either COS or CrOS GCS buckets\"\n        return
+    ${RETCODE_ERROR}\n  fi\n\n  # Install toolchain pkg\n  install_cross_toolchain_pkg
+    \"${tc_download_url}\"\n}\n\n# Download and install kernel headers from the CI
+    or tryjob build directory\ninstall_build_kernel_headers() {\n  local -r bucket=\"$1\"\n\n
+    \ info \"Downloading and installing a kernel headers\"\n  local -r kernel_headers_file_path=\"${bucket}/${KERNEL_HEADERS}\"\n
+    \ info \"Obtaining kernel headers file from ${kernel_headers_file_path}\"\n\n
+    \ if ! download_from_gcs \"${kernel_headers_file_path}\" \"${BUILD_DIR}/${KERNEL_HEADERS}\";
+    then\n        return ${RETCODE_ERROR}\n  fi\n  mkdir -p \"${BUILD_DIR}/${KERNEL_HEADERS_DIR}\"\n
+    \ tar axf \"${BUILD_DIR}/${KERNEL_HEADERS}\" -C \"${BUILD_DIR}/${KERNEL_HEADERS_DIR}\"\n
+    \ rm -f \"${BUILD_DIR}/${KERNEL_HEADERS}\"\n}\n\ninstall_generic_cross_toolchain()
+    {\n  info \"Downloading and installing a toolchain\"\n  # Download toolchain_env
+    if present\n  local -r tc_date=\"$(echo ${CROS_TC_VERSION} | sed  -E 's/\\.(..).*/\\/\\1/')\"\n
+    \ local -r tc_download_url=\"${CROS_TC_DOWNLOAD_GCS}${tc_date}/${TOOLCHAIN_ARCH}-cros-linux-gnu-${CROS_TC_VERSION}.tar.xz\"\n\n
+    \ # Install toolchain pkg\n  install_cross_toolchain_pkg \"${tc_download_url}\"\n}\n\nset_compilation_env()
+    {\n  local -r tc_env_file_path=\"${COS_DOWNLOAD_GCS}/${RELEASE_ID}/${TOOLCHAIN_ENV_FILENAME}\"\n
+    \ # toolchain_env file will set 'CC' and 'CXX' environment\n  # variable based
+    on the toolchain used for kernel compilation\n  if [[ -f \"${BUILD_DIR}/${TOOLCHAIN_ENV_FILENAME}\"
+    ]]; then\n    source \"${BUILD_DIR}/${TOOLCHAIN_ENV_FILENAME}\"\n    export CC\n
+    \   export CXX\n  else\n    export CC=\"${TOOLCHAIN_ARCH}-cros-linux-gnu-clang\"\n
+    \   export CXX=\"${TOOLCHAIN_ARCH}-cros-linux-gnu-clang++\"\n  fi\n  info \"Configuring
+    environment variables for cross-compilation\"\n  # CC and CXX are already set
+    in toolchain_env\n  TOOLCHAIN_DIR=\"${BUILD_DIR}/toolchain\"\n  export PATH=\"${TOOLCHAIN_DIR}/bin:${TOOLCHAIN_DIR}/usr/bin:${PATH}\"\n
+    \ export SYSROOT=\"${TOOLCHAIN_DIR}/usr/${TOOLCHAIN_ARCH}-cros-linux-gnu\"\n  export
+    HOSTCC=\"x86_64-pc-linux-gnu-clang\"\n  export HOSTCXX=\"x86_64-pc-linux-gnu-clang++\"\n
+    \ export LD=\"${TOOLCHAIN_ARCH}-cros-linux-gnu-ld.lld\"\n  export HOSTLD=\"x86_64-pc-linux-gnu-ld.lld\"\n
+    \ export OBJCOPY=llvm-objcopy\n  export STRIP=llvm-strip\n  export KERNEL_ARCH\n
+    \ export TOOLCHAIN_ARCH\n  export LLVM_IAS=1\n  if [[ \"${MODE}\" = \"release\"
+    || \"${MODE}\" = \"build\" || \"${MODE}\" = \"custom\" ]]; then\n    local -r
+    headers_dir=$(ls -d ${BUILD_DIR}/${KERNEL_HEADERS_DIR}/usr/src/linux-headers*)\n
+    \   export KHEADERS=\"${headers_dir}\"\n  fi\n}\n\nkmake() {\n  local output_dir_arg=\"KBUILD_OUTPUT=\"\n
+    \ if [[ \"${KBUILD_OUTPUT}\" != \".\" ]]; then\n    output_dir_arg=\"KBUILD_OUTPUT=${KBUILD_OUTPUT}\"\n
+    \ fi\n  env ARCH=${KERNEL_ARCH} make ARCH=${KERNEL_ARCH} \\\n    CC=\"${CC}\"
+    CXX=\"${CXX}\" LD=\"${LD}\" \\\n    STRIP=\"${STRIP}\" OBJCOPY=\"${OBJCOPY}\"
+    \\\n    HOSTCC=\"${HOSTCC}\" HOSTCXX=\"${HOSTCXX}\" HOSTLD=\"${HOSTLD}\" \\\n
+    \   \"${output_dir_arg}\" \\\n    \"$@\"\n}\nexport -f kmake\n\ngpu_build() {\n
+    \ if [[ ${KERNEL_ARCH} != \"x86_64\" ]]; then\n    echo \"GPU driver builds only
+    tested for x86.\n    Current architecture detected: ${KERNEL_ARCH}\"\n    exit
+    1\n  fi\n  make -C \"/src/${GPU_DIR}\" modules VERBOSE=1 V=1 \\\n    SYSSRC=\"/src/\"
+    \\\n    TARGET_ARCH=${KERNEL_ARCH} \\\n    CC=\"x86_64-cros-linux-gnu-clang\"
+    \\\n    LD=\"x86_64-cros-linux-gnu-ld.bfd\" \\\n    AR=\"x86_64-cros-linux-gnu-ar\"
+    \\\n    CXX=\"x86_64-cros-linux-gnu-gcc\" \\\n    OBJCOPY=\"x86_64-cros-linux-gnu-objcopy\"
+    \\\n    OBJDUMP=\"x86_64-cros-linux-gnu-objdump\" \\\n    NV_VERBOSE=1 IGNORE_CC_MISMATCH=yes
+    \\\n    \"$@\"\n}\n\ntar_kernel_headers() {\n  local -r version=$(kmake \"$@\"
+    -s kernelrelease)\n  local -r tmpdir=\"$(mktemp -d)\"\n  local arch_dir\n  case
+    \"${KERNEL_ARCH}\" in\n    x86_64) arch_dir=\"x86\" ;;\n    arm64)  arch_dir=\"arm64\"
+    ;;\n    *)\n      echo \"Unknown kernel architecture: ${KERNEL_ARCH}\"\n      exit
+    $RETCODE_ERROR\n      ;;\n  esac\n\n  (\n    find . -name Makefile\\* -o -name
+    Kconfig\\* -o -name \\*.pl\n    find arch/*/include include scripts -type f -o
+    -type l\n    find \"arch/${arch_dir}\" -name module.lds -o -name Kbuild.platforms
+    -o -name Platform\n    find \"arch/${arch_dir}\" -name include -o -name scripts
+    -type d | while IFS='' read -r line; do\n      find \"${line}\" -type f\n    done\n
+    \ ) > \"${tmpdir}/hdrsrcfiles\"\n\n  pushd \"${KBUILD_OUTPUT}\"\n  (\n    if [[
+    -d tools/objtool ]]; then\n      find tools/objtool -type f -executable\n    fi\n
+    \   find \"arch/${arch_dir}/include\" Module.symvers System.map \\\n      include
+    scripts .config \\\n      -type f ! -name \"*.cmd\"  ! -name \"*.o\"\n  ) > \"${tmpdir}/hdrobjfiles\"\n
+    \ popd\n\n  local -r destdir=\"${tmpdir}/headers_tmp/usr/src/linux-headers-${version}\"\n
+    \ mkdir -p \"${destdir}\"\n  mkdir -p \"${destdir}/build\"\n  tar -c -f - -T \"${tmpdir}/hdrsrcfiles\"
+    | tar -xf - -C \"${destdir}\"\n  # separate generated files and main sources for
+    now\n  # this is to prevent breakage in linux-info.eclass that\n  # rely on src
+    and build being separated\n  tar -c -f - -C ${KBUILD_OUTPUT} -T \"${tmpdir}/hdrobjfiles\"
+    | tar -xf - -C \"${destdir}/build\"\n  echo \"include ../Makefile\" > \"${destdir}/build/Makefile\"\n\n
+    \ rm \"${tmpdir}/hdrsrcfiles\" \"${tmpdir}/hdrobjfiles\"\n\n  tar -C \"${tmpdir}/headers_tmp\"
+    -c -z -f \"cos-kernel-headers-${version}-${KERNEL_ARCH}.tgz\" .\n  rm -rf \"${tmpdir}\"\n}\n\nkernel_build()
+    {\n  local -r tmproot_dir=\"$(mktemp -d)\"\n  local image_target\n\n  case \"${KERNEL_ARCH}\"
+    in\n    x86_64)   image_target=\"bzImage\" ;;\n    arm64) image_target=\"Image\"
+    ;;\n    *)\n      echo \"Unknown kernel architecture: ${KERNEL_ARCH}\"\n      exit
+    $RETCODE_ERROR\n      ;;\n  esac\n\n  if [[ \"${CLEAN_BEFORE_BUILD}\" = \"true\"
+    ]]; then\n    kmake \"$@\" mrproper\n  fi\n  kmake \"$@\" \"${KERNEL_CONFIGS[@]}\"\n
+    \ kmake \"$@\" \"${image_target}\" modules\n  # kernelrelease should be evaluated
+    after the build\n  # otherwise CONFIG_LOCALVERSION value is not picked up properly\n
+    \ local -r version=$(kmake \"$@\" -s kernelrelease)\n  INSTALL_MOD_PATH=\"${tmproot_dir}\"
+    kmake \"$@\" modules_install\n\n  mkdir -p \"${tmproot_dir}/boot/\"\n  cp -v --
+    \"${KBUILD_OUTPUT}/.config\" \"${tmproot_dir}/boot/config-${version}\"\n  cp -v
+    -- \"${KBUILD_OUTPUT}/arch/${KERNEL_ARCH}/boot/${image_target}\" \"${tmproot_dir}/boot/vmlinuz-${version}\"\n\n
+    \ for module in $(find \"$tmproot_dir/lib/modules/\" -name \"*.ko\" -printf '%P\\n');
+    do\n    module=\"lib/modules/$module\"\n    mkdir -p \"$(dirname \"$tmproot_dir/usr/lib/debug/$module\")\"\n
+    \   # only keep debug symbols in the debug file\n    $OBJCOPY --only-keep-debug
+    \"$tmproot_dir/$module\" \"$tmproot_dir/usr/lib/debug/$module\"\n    # strip original
+    module from debug symbols\n    $OBJCOPY --strip-debug \"$tmproot_dir/$module\"\n
+    \   # then add a link to those\n    $OBJCOPY --add-gnu-debuglink=\"$tmproot_dir/usr/lib/debug/$module\"
+    \"$tmproot_dir/$module\"\n  done\n\n  if [[ \"${BUILD_DEBUG_PACKAGE}\" = \"true\"
+    ]]; then\n    cp -v -- \"${KBUILD_OUTPUT}/vmlinux\" \"${tmproot_dir}/usr/lib/debug/lib/modules/${version}/\"\n
+    \   # Some other tools expect other locations\n    mkdir -p \"$tmproot_dir/usr/lib/debug/boot/\"\n
+    \   ln -s \"../lib/modules/$version/vmlinux\" \"$tmproot_dir/usr/lib/debug/boot/vmlinux-$version\"\n
+    \   ln -s \"lib/modules/$version/vmlinux\" \"$tmproot_dir/usr/lib/debug/vmlinux-$version\"\n
+    \   tar -c -J -f \"cos-kernel-debug-${version}-${KERNEL_ARCH}.txz\" -C \"${tmproot_dir}/usr/lib\"
+    debug/\n  fi\n\n  tar -c -J -f \"cos-kernel-${version}-${KERNEL_ARCH}.txz\" -C
+    \"${tmproot_dir}\" boot/ lib/\n  rm -rf \"${tmproot_dir}\"\n\n  if [[ \"${BUILD_HEADERS_PACKAGE}\"
+    = \"true\" ]]; then\n    tar_kernel_headers\n  fi\n\n  # pass env information\n
+    \ echo \"CC=${CC}\" >  \"${KBUILD_OUTPUT}/toolchain_env\"\n  echo \"CXX=${CXX}\"
+    >>  \"${KBUILD_OUTPUT}/toolchain_env\"\n\n  # pass toolchain source location\n
+    \ if [[ -f \"${BUILD_DIR}/toolchain_url\" ]]; then\n    cp \"${BUILD_DIR}/toolchain_url\"
+    \"${KBUILD_OUTPUT}/toolchain_url\";\n  fi\n}\n\nmodule_build() {\n  if [[ \"${CLEAN_BEFORE_BUILD}\"
+    = \"true\" ]]; then\n    kmake -C \"${KHEADERS}\" M=\"$(pwd)\" \"$@\" clean\n
+    \ fi\n  kmake -C \"${KHEADERS}\" M=\"$(pwd)\" \"$@\" modules\n}\n\nusage() {\ncat
+    1>&2 <<__EOUSAGE__\nUsage: $0 [-k | -m | -i] [-cdH] [-A <x86_64|arm64>]\n    [-C
+    <kernelconfig>[,fragment1.config,...]] [-O  <objdir>]\n    [-B <build> -b <board>
+    | -R <release> | -G <bucket>]\n    [-t <toolchain_version>] [VAR=value ...] [target
+    ...]\n\nOptions:\n  -A <arch>     target architecture. Valid values are x86_64
+    and arm64.\n  -B <build>    seed the toolchain from the COS build <build>.\n                Example:
+    R93-16623.0.0. Instead of the actual\n                build number developer can
+    specify the branch name\n                to use the latest build off that branch.\n
+    \               Example: main-R93, release-R89. Requires -b option.\n  -C <configs>
+    \ kernel configs target. Example: lakitu_defconfig.\n                It's also
+    possible to specify main config and fragments\n                separated by coma,
+    i.e.: lakitu_defconfig,google/xfstest.config\n  -G <bucket>   seed the toolchain
+    and kernel headers from the custom\n                GCS bucket <bucket>. Directory
+    structure needs to conform\n                to the COS standard.\n  -H            create
+    a package with kernel headers for the respective\n                kernel package.
+    Should be used only with -k option.\n  -O <objdir>   value for KBUILD_OUTPUT to
+    separate obj files from\n                sources\n  -R <release>  seed the toolchain
+    and kernel headers from the\n                specified official COS release. Example:
+    16442.0.0\n  -b <board>    specify board for -B argument. Example: lakitu\n  -c
+    \           perform \"mrproper\" step when building a kernel package or\n                \"clean\"
+    step when building a module.\n                Should be used only with -k and
+    -m option.\n  -d            create a package with debug symbols for the respective\n
+    \               kernel package. Should be used only with -k option.\n  -h            show
+    this message.\n  -i            invoke interactive shell with kernel development\n
+    \               environment initialized.\n  -k            build a kernel package
+    for sources mapped from the host\n                to the current working directory.\n
+    \ -m            build an out-of-tree module for sources mapped from\n                the
+    host to the current working directory.\n                This mode requires either
+    -R or -B/b options.\n  -t            seed the toolchain from the Chromium OS upstream.\n
+    \               Example: 2021.06.26.094653\n  -x <src>      build the nvidia gpu
+    modules from the specified source relative\n                to the kernel source
+    directory. Output nvidia gpu modules\n                present in the <x>/kernel-open/
+    dir.\n                Example: -x nvidia/kernel-module-src, modules generated
+    in:\n                nvidia/kernel-module-src/kernel-open as nvidia*.ko\n__EOUSAGE__\n\n
+    \ exit $RETCODE_ERROR\n}\n\nmain() {\n  local build_target=\"\"\n  local custom_bucket=\"\"\n
+    \ get_cos_tools_bucket\n  while getopts \"A:B:C:G:HO:R:b:cdhikmtx:\" o; do\n    case
+    \"${o}\" in\n      A) KERNEL_ARCH=${OPTARG} ;;\n      B) BUILD_ID=${OPTARG} ;;\n
+    \     C) KERNEL_CONFIGS=(${OPTARG//,/ }) ;;\n      G) custom_bucket=${OPTARG}
+    ;;\n      H) BUILD_HEADERS_PACKAGE=\"true\" ;;\n      O) KBUILD_OUTPUT=${OPTARG}
+    ;;\n      R) RELEASE_ID=${OPTARG} ;;\n      b) BOARD=${OPTARG} ;;\n      c) CLEAN_BEFORE_BUILD=\"true\"
+    ;;\n      d) BUILD_DEBUG_PACKAGE=\"true\" ;;\n      h) usage ;;\n      i) build_target=\"shell\"
+    ;;\n      k) build_target=\"kernel\" ;;\n      m) build_target=\"module\" ;;\n
+    \     t) CROS_TC_VERSION=\"${OPTARG}\" ;;\n      x) build_target=\"gpu\"\n        GPU_DIR=${OPTARG}
+    ;;\n      *) usage ;;\n    esac\n  done\n  shift $((OPTIND-1))\n\n  if [[ ! -z
+    \"${BOARD}\" ]]; then\n    case \"${BOARD}\" in\n      lakitu-arm64) KERNEL_ARCH=arm64
+    ;;\n      *) KERNEL_ARCH=x86_64 ;;\n    esac\n  fi\n\n  case \"${KERNEL_ARCH}\"
+    in\n    x86_64)\n      TOOLCHAIN_ARCH=x86_64\n      ;;\n    arm64)\n      TOOLCHAIN_ARCH=aarch64\n
+    \     ;;\n    *)\n      echo \"Invalid -A value: $KERNEL_ARCH\"\n      usage\n
+    \     ;;\n  esac\n\n  echo \"** Kernel architecture: $KERNEL_ARCH\"\n  echo \"**
+    Toolchain architecture: $TOOLCHAIN_ARCH\"\n\n  if [[ -n \"$RELEASE_ID\" ]]; then\n
+    \   MODE=\"release\"\n    BUILD_DIR=\"/build/${TOOLCHAIN_ARCH}-${RELEASE_ID}\"\n
+    \   echo \"** COS release: $RELEASE_ID\"\n  fi\n\n  if [[ -n \"$BUILD_ID\" ]];
+    then\n    if ! [[ $BUILD_ID =~ R[0-9]+-[0-9.]+ ]]; then\n      BRANCH=\"${BUILD_ID}\"\n
+    \     echo \"** Obtaining the latest build # for branch ${BRANCH}...\"\n      readonly
+    latest=\"${COS_CI_DOWNLOAD_GCS}/${BOARD}-release/LATEST-${BUILD_ID}\"\n      BUILD_ID=$(gsutil
+    -q cat \"${latest}\" || true)\n      if [[ -n \"$BUILD_ID\" ]]; then\n        echo
+    \"** Latest build for branch ${BRANCH} is ${BUILD_ID}\"\n      else\n        echo
+    \"** Failed to find latest build for branch ${BRANCH}\"\n        exit 1\n      fi\n
+    \   fi\n  fi\n\n  if [[ -z \"$MODE\" && -n \"$BOARD\" && -n \"$BUILD_ID\" ]];
+    then\n    MODE=\"build\"\n    echo \"** COS build: $BOARD-$BUILD_ID\"\n    BUILD_DIR=\"/build/${BOARD}-${BUILD_ID}\"\n
+    \ fi\n\n  if [[ -z \"$MODE\" && -n \"$custom_bucket\" ]]; then\n    MODE=\"custom\"\n
+    \   BUILD_DIR=\"/build/$(basename \"${custom_bucket}\")\"\n  fi\n\n  if [[ -z
+    \"$MODE\" ]]; then\n    MODE=\"cross\"\n    BUILD_DIR=\"/build/cros-${CROS_TC_VERSION}-${TOOLCHAIN_ARCH}\"\n
+    \ fi\n  echo \"Mode: $MODE\"\n\n  if [[ -n \"${BUILD_DIR}\" ]]; then\n    if [[
+    ! -d \"${BUILD_DIR}\" ]]; then\n      mkdir -p \"${BUILD_DIR}\"\n      case \"$MODE\"
+    in\n        cross)\n          install_generic_cross_toolchain\n          ;;\n
+    \       release)\n          install_release_cross_toolchain\n          install_release_kernel_headers\n
+    \         ;;\n        build)\n          local -r bucket=\"${COS_CI_DOWNLOAD_GCS}/${BOARD}-release/${BUILD_ID}\"\n
+    \         install_build_cross_toolchain \"${bucket}\"\n          install_build_kernel_headers
+    \"${bucket}\"\n          ;;\n        custom)\n          install_build_cross_toolchain
+    \"${custom_bucket}\"\n          install_build_kernel_headers \"${custom_bucket}\"\n
+    \         ;;\n      esac\n    fi\n  fi\n\n  set_compilation_env\n\n  case \"${build_target}\"
+    in\n    kernel) kernel_build -j\"$(nproc)\" ;;\n    module) module_build -j\"$(nproc)\"
+    ;;\n    shell)\n      echo \"Starting interactive shell for the kernel devenv\"\n
+    \     /bin/bash\n      ;;\n    gpu) gpu_build -j\"$(nproc)\" ;;\n    *) kmake
+    -j\"$(nproc)\" \"$@\" ;;\n  esac\n}\n\nmain \"$@\"\n"
+  run-weka-cli.sh: |
+    #!/bin/bash
+
+    set -o pipefail
+    set -e
+
+    if [[ -f /var/run/secrets/weka-operator/operator-user/username ]]; then
+      export WEKA_USERNAME=`cat /var/run/secrets/weka-operator/operator-user/username`
+      export WEKA_PASSWORD=`cat /var/run/secrets/weka-operator/operator-user/password`
+      export WEKA_ORG=`cat /var/run/secrets/weka-operator/operator-user/org`
+    fi
+
+    # comes either out of pod spec on repeat run or from resources.json on first run
+    if [[ "$PORT" == "0" ]]; then
+      if [[ -f /opt/weka/k8s-runtime/vars/port ]]; then
+        export PORT=`cat /opt/weka/k8s-runtime/vars/port`
+        export WEKA_PORT=`cat /opt/weka/k8s-runtime/vars/port`
+      fi
+    fi
+
+    if [[ "$AGENT_PORT" == "0" ]]; then
+      if [[ -f /opt/weka/k8s-runtime/vars/agent_port ]]; then
+        export AGENT_PORT=`cat /opt/weka/k8s-runtime/vars/agent_port`
+      fi
+    fi
+
+
+    /usr/bin/weka "$@"
+  syslog-ng.conf: |
+    @version: 3.35
+
+    options {
+        use_dns(no);
+        dns_cache(no);
+        keep_hostname(yes);
+        create_dirs(yes);
+        ts_format(iso);
+    };
+
+    source s_net {
+        unix-stream("/var/run/syslog-ng/syslog-ng.sock");
+        unix-dgram("/run/systemd/journal/dev-log", create_dirs(yes));
+    };
+
+    destination d_stdout {
+        file("/dev/stdout"
+            template("$ISODATE $MSGHDR | $MSG\n")
+        );
+    };
+
+    destination d_syslog {
+        file("/var/log/syslog"
+            template("$ISODATE $MSGHDR | $MSG\n")
+            template_escape(no)
+        );
+    };
+
+    destination d_error {
+        file("/var/log/error"
+            template("$ISODATE $MSGHDR | $MSG\n")
+            template_escape(no)
+        );
+    };
+
+    filter f_info {
+        match(".*(NOTICE|WARN(ING)*|ERR(OR)*|CRIT(ICAL)*|ALERT|EMERG(ENCY)*|FATAL|ASSERT):.*" value("MESSAGE"));
+    };
+
+    filter f_error {
+        match(".*(ERR(OR)*|CRIT(ICAL)*|ALERT|EMERG(ENCY)*|FATAL|ASSERT):.*" value("MESSAGE"));
+    };
+
+    log {
+        source(s_net);
+        filter(f_info);
+        destination(d_stdout);
+    };
+
+    log {
+        source(s_net);
+        destination(d_syslog);
+    };
+
+    log {
+        source(s_net);
+        filter(f_error);
+        destination(d_error);
+    };
+  weka_runtime.py: "import base64\nimport fcntl\nimport ipaddress\nimport json\nimport
+    logging\nimport os\nimport re\nimport socket\nimport struct\nimport subprocess\nimport
+    sys\nimport threading\nimport time\nimport uuid\nfrom dataclasses import dataclass,
+    asdict, fields\nfrom functools import lru_cache, partial\nfrom os.path import
+    exists\nfrom textwrap import dedent\nfrom typing import List, Optional, Tuple,
+    Set, Union\n\n\n@dataclass\nclass SignOptions:\n    allowEraseWekaPartitions:
+    bool = False\n    allowEraseNonWekaPartitions: bool = False\n    allowNonEmptyDevice:
+    bool = False\n    skipTrimFormat: bool = False\n\n\n@dataclass\nclass Disk:\n
+    \   path: str\n    is_mounted: bool\n    serial_id: Optional[str]\n\n\nMODE =
+    os.environ.get(\"MODE\")\nassert MODE != \"\"\nNUM_CORES = int(os.environ.get(\"CORES\",
+    0))\nCORE_IDS = os.environ.get(\"CORE_IDS\", \"auto\")\nCPU_POLICY = os.environ.get(\"CPU_POLICY\",
+    \"auto\")\nNAME = os.environ[\"NAME\"]\nNETWORK_DEVICE = os.environ.get(\"NETWORK_DEVICE\",
+    \"\")\nSUBNETS = os.environ.get(\"SUBNETS\", \"\")\nNETWORK_SELECTORS = os.environ.get(\"NETWORK_SELECTORS\",
+    \"\")\nMANAGEMENT_IPS_SELECTORS = os.environ.get(\"MANAGEMENT_IPS_SELECTORS\",
+    \"\")\nPORT = os.environ.get(\"PORT\", \"\")\nAGENT_PORT = os.environ.get(\"AGENT_PORT\",
+    \"\")\nRESOURCES = {}  # to be populated at later stage\nMEMORY = os.environ.get(\"MEMORY\",
+    \"\")\nJOIN_IPS = os.environ.get(\"JOIN_IPS\", \"\")\nDIST_SERVICE = os.environ.get(\"DIST_SERVICE\")\nOS_DISTRO
+    = \"\"\nOS_BUILD_ID = \"\"\nDISCOVERY_SCHEMA = 1\nINSTRUCTIONS = os.environ.get(\"INSTRUCTIONS\",
+    \"\")\nNODE_NAME = os.environ[\"NODE_NAME\"]\nPOD_ID = os.environ.get(\"POD_ID\",
+    \"\")\nFAILURE_DOMAIN = os.environ.get(\"FAILURE_DOMAIN\", None)\nMACHINE_IDENTIFIER
+    = os.environ.get(\"MACHINE_IDENTIFIER\", None)\nNET_GATEWAY = os.environ.get(\"NET_GATEWAY\",
+    None)\nIS_IPV6 = os.environ.get(\"IS_IPV6\", \"false\") == \"true\"\nMANAGEMENT_IPS
+    = []  # to be populated at later stage\nUDP_MODE = os.environ.get(\"UDP_MODE\",
+    \"false\") == \"true\"\nDUMPER_CONFIG_MODE = os.environ.get(\"DUMPER_CONFIG_MODE\",
+    \"auto\")\n\nKUBERNETES_DISTRO_OPENSHIFT = \"openshift\"\nKUBERNETES_DISTRO_GKE
+    = \"gke\"\nOS_NAME_GOOGLE_COS = \"cos\"\nOS_NAME_REDHAT_COREOS = \"rhcos\"\n\nMAX_TRACE_CAPACITY_GB
+    = os.environ.get(\"MAX_TRACE_CAPACITY_GB\", 10)\nENSURE_FREE_SPACE_GB = os.environ.get(\"ENSURE_FREE_SPACE_GB\",
+    20)\n\nWEKA_CONTAINER_ID = os.environ.get(\"WEKA_CONTAINER_ID\", \"\")\nWEKA_PERSISTENCE_DIR
+    = \"/host-binds/opt-weka\"\nWEKA_PERSISTENCE_MODE = os.environ.get(\"WEKA_PERSISTENCE_MODE\",
+    \"local\")\nWEKA_PERSISTENCE_GLOBAL_DIR = \"/opt/weka-global-persistence\"\nif
+    WEKA_PERSISTENCE_MODE == \"global\":\n    WEKA_PERSISTENCE_DIR = os.path.join(WEKA_PERSISTENCE_GLOBAL_DIR,
+    \"containers\", WEKA_CONTAINER_ID)\n\nWEKA_COS_ALLOW_HUGEPAGE_CONFIG = True if
+    os.environ.get(\"WEKA_COS_ALLOW_HUGEPAGE_CONFIG\", \"false\") == \"true\" else
+    False\nWEKA_COS_ALLOW_DISABLE_DRIVER_SIGNING = True if os.environ.get(\"WEKA_COS_ALLOW_DISABLE_DRIVER_SIGNING\",\n
+    \                                                              \"false\") == \"true\"
+    else False\nWEKA_COS_GLOBAL_HUGEPAGE_SIZE = os.environ.get(\"WEKA_COS_GLOBAL_HUGEPAGE_SIZE\",
+    \"2M\").lower()\nWEKA_COS_GLOBAL_HUGEPAGE_COUNT = int(os.environ.get(\"WEKA_COS_GLOBAL_HUGEPAGE_COUNT\",
+    4000))\n\nAWS_VENDOR_ID = \"1d0f\"\nAWS_DEVICE_ID = \"cd01\"\nGCP_VENDOR_ID =
+    \"0x1ae0\"\nGCP_DEVICE_ID = \"0x001f\"\nAUTO_REMOVE_TIMEOUT = int(os.environ.get(\"AUTO_REMOVE_TIMEOUT\",
+    \"0\"))\n\n# for client dynamic port allocation\nBASE_PORT = os.environ.get(\"BASE_PORT\",
+    \"\")\nPORT_RANGE = os.environ.get(\"PORT_RANGE\", \"0\")\nWEKA_CONTAINER_PORT_SUBRANGE
+    = 100\nMAX_PORT = 65535\n\n# Define global variables\nexiting = 0\n\n# Formatter
+    with channel name\nformatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s
+    - %(message)s')\n\n# Define handlers for stdout and stderr\nstdout_handler = logging.StreamHandler(sys.stdout)\nstdout_handler.setLevel(logging.DEBUG)\nstderr_handler
+    = logging.StreamHandler(sys.stderr)\nstderr_handler.setLevel(logging.WARNING)\n\n#
+    Basic configuration\nlogging.basicConfig(\n    level=logging.DEBUG,  # Global
+    minimum logging level\n    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    \ # Include timestamp\n    handlers=[stdout_handler, stderr_handler]\n)\n\n\nclass
+    FeaturesFlags:\n    # Bit positions (class-level ints) – will be shadowed by bools
+    on the instance\n    traces_override_partial_support: Union[bool, int] = 0\n    traces_override_in_slash_traces:
+    Union[bool, int] = 1\n\n    def __init__(self, b64_flags: Optional[str]) -> None:\n
+    \       active: Set[int] = set(parse_feature_bitmap(b64_flags or \"\"))\n\n        #
+    Walk over class attributes that are ints (flag indices)\n        for name, bit
+    in self.__class__.__dict__.items():\n            if isinstance(bit, int):  # skip
+    dunders, methods, etc.\n                # true  ⇢ flag bit present, false ⇢ absent\n
+    \               setattr(self, name, bit in active)\n\n        # Store raw list/set
+    if needed elsewhere\n        self._active_bits: Set[int] = active\n\n\ndef parse_feature_bitmap(b64_str:
+    str) -> list[int]:\n    \"\"\"\n    Reverse of get_feature_bitmap():\n    * Accepts
+    the Base-64 string produced by get_feature_bitmap\n    * Returns a sorted list
+    of bit indexes that are set (e.g. [1, 5, 30])\n    \"\"\"\n    if not b64_str:
+    \ # empty / None -> no features\n        return []\n\n    bitmap: bytes = base64.b64decode(b64_str)\n
+    \   indexes: list[int] = []\n\n    for byte_idx, byte in enumerate(bitmap):\n
+    \       if byte == 0:  # quick skip for sparse bitmaps\n            continue\n
+    \       for bit_idx in range(8):\n            if byte & (1 << bit_idx):  # same
+    bit ordering as encoder\n                indexes.append(byte_idx * 8 + bit_idx)\n\n
+    \   return indexes\n\nasync def get_serial_id_cos_specific(device_path: str) ->
+    Optional[str]:\n    \"\"\"\n    Get serial ID for Google COS\n    \"\"\"\n    logging.info(f\"Getting
+    serial ID for {device_path} using COS-specific method\")\n    device_name = os.path.basename(device_path)
+    \ # Returns \"nvme0n1\"\n\n    cmd = f\"cat /sys/block/{device_name}/wwid 2>/dev/null
+    || echo 'None'\"\n\n    stdout, stderr, ec = await run_command(cmd)\n\n    if
+    ec != 0:\n        logging.warning(f\"COS-specific fallback failed: could not get
+    info for {device_path}: {stderr.decode()}\")\n        return None\n\n    serial_id
+    = stdout.decode().strip()\n    if serial_id and serial_id != 'None':\n        logging.info(f\"COS-specific
+    fallback successful for {device_path}, found serial id: {serial_id}\")\n        return
+    serial_id\n\n    logging.warning(f\"COS-specific fallback failed: could not find
+    serial id for {device_name}\")\n    return None\n\nasync def get_serial_id_fallback(device_path:
+    str) -> Optional[str]:\n    \"\"\"\n    Fallback method to get serial ID for a
+    device using udev data.\n    This is useful for non-nvme devices where lsblk might
+    not report a serial.\n    \"\"\"\n    device_name = os.path.basename(device_path)\n
+    \   logging.info(f\"Attempting fallback to get serial for {device_name}\")\n    try:\n
+    \       # Get major:minor device number\n        dev_index_out, _, ec = await
+    run_command(f\"cat /sys/block/{device_name}/dev\")\n        if ec != 0:\n            logging.warning(f\"Fallback
+    failed: could not get dev index for {device_name}\")\n            return None\n
+    \       dev_index = dev_index_out.decode().strip()\n\n        # Get serial from
+    udev data\n        serial_id_cmd = f\"cat /host/run/udev/data/b{dev_index} | grep
+    ID_SERIAL=\"\n        serial_id_out, _, ec = await run_command(serial_id_cmd)\n
+    \       if ec != 0:\n            logging.warning(f\"Fallback failed: could not
+    get ID_SERIAL from udev for {device_name}\")\n            return None\n\n        serial_id
+    = serial_id_out.decode().strip().split(\"=\")[-1]\n        logging.info(f\"Fallback
+    successful for {device_name}, found serial: {serial_id}\")\n        return serial_id\n
+    \   except Exception as e:\n        logging.error(f\"Exception during serial ID
+    fallback for {device_name}: {e}\")\n        return None\n\n\nasync def sign_drives_by_pci_info(vendor_id:
+    str, device_id: str, options: dict) -> List[str]:\n    logging.info(\"Signing
+    drives. Vendor ID: %s, Device ID: %s\", vendor_id, device_id)\n\n    if not vendor_id
+    or not device_id:\n        raise ValueError(\"Vendor ID and Device ID are required\")\n\n
+    \   cmd = f\"lspci -d {vendor_id}:{device_id}\" + \" | sort | awk '{print $1}'\"\n
+    \   stdout, stderr, ec = await run_command(cmd)\n    if ec != 0:\n        return\n\n
+    \   signed_drives = []\n    pci_devices = stdout.decode().strip().split()\n    for
+    pci_device in pci_devices:\n        device = f\"/dev/disk/by-path/pci-0000:{pci_device}-nvme-1\"\n
+    \       try:\n            await sign_device_path(device, options)\n            signed_drives.append(device)\n
+    \       except SignException as e:\n            logging.error(str(e))\n            continue\n
+    \   return signed_drives\n\n\nasync def find_disks() -> List[Disk]:\n    \"\"\"\n
+    \   Find all disk devices and check if they or their partitions are mounted.\n
+    \   :return: A list of Disk objects.\n    \"\"\"\n    logging.info(\"Finding disks
+    and checking mount status\")\n    # Use -J for JSON output, -p for full paths,
+    -o to specify columns\n    # TODO: We are dependant on lsblk here on host here.
+    Is it a probelm? potentially\n    cmd = \"nsenter --mount --pid --target 1 --
+    lsblk -p -J -o NAME,TYPE,MOUNTPOINT,SERIAL\"\n    stdout, stderr, ec = await run_command(cmd,
+    capture_stdout=True)\n    if ec != 0:\n        logging.error(f\"Failed to execute
+    lsblk: {stderr.decode()}\")\n        return []\n\n    try:\n        data = json.loads(stdout)\n
+    \   except json.JSONDecodeError:\n        logging.error(f\"Failed to parse lsblk
+    JSON output: {stdout.decode()}\")\n        return []\n\n    disks = []\n\n    def
+    has_mountpoint(device_info: dict) -> bool:\n        \"\"\"Recursively check if
+    a device or any of its children has a mountpoint.\"\"\"\n        if device_info.get(\"mountpoint\"):\n
+    \           return True\n        if \"children\" in device_info:\n            for
+    child in device_info[\"children\"]:\n                if has_mountpoint(child):\n
+    \                   return True\n        return False\n\n    for device in data.get(\"blockdevices\",
+    []):\n        if device.get(\"type\") == \"disk\":\n            is_mounted = has_mountpoint(device)\n
+    \           serial_id = device.get(\"serial\")\n            device_path = device[\"name\"]\n
+    \           if not serial_id:\n                logging.warning(f\"lsblk did not
+    return serial for {device_path}. Using fallback.\")\n                serial_id
+    = await get_serial_id_fallback(device_path)\n            if is_google_cos():\n
+    \               logging.info(f\"Using COS-specific method for {device_path}\")\n
+    \               device_name = os.path.basename(device_path)\n                serial_id
+    = await get_serial_id_cos_specific(device_name)\n\n            logging.info(f\"Found
+    drive: {device_path}, mounted: {is_mounted}, serial: {serial_id}\")\n            disks.append(Disk(path=device_path,
+    is_mounted=is_mounted, serial_id=serial_id))\n\n    return disks\n\n\nasync def
+    sign_not_mounted(options: dict) -> List[str]:\n    \"\"\"\n    Signs all disk
+    devices that are not mounted and have no mounted partitions.\n    :param options:\n
+    \   :return: list of signed drive paths\n    \"\"\"\n    logging.info(\"Signing
+    drives that are not mounted\")\n    all_disks = await find_disks()\n    signed_drives
+    = []\n\n    unmounted_disks = [disk for disk in all_disks if not disk.is_mounted]\n
+    \   logging.info(f\"Found {len(unmounted_disks)} unmounted disks to sign: {[d.path
+    for d in unmounted_disks]}\")\n\n    for disk in unmounted_disks:\n        try:\n
+    \           await sign_device_path(disk.path, options)\n            signed_drives.append(disk.path)\n
+    \       except SignException as e:\n            logging.error(str(e))\n            continue\n
+    \   return signed_drives\n\n\nasync def sign_device_paths(devices_paths, options)
+    -> List[str]:\n    signed_drives = []\n    for device_path in devices_paths:\n
+    \       try:\n            await sign_device_path(device_path, options)\n            signed_drives.append(device_path)\n
+    \       except SignException as e:\n            logging.error(str(e))\n            continue\n
+    \   return signed_drives\n\n\nclass SignException(Exception):\n    pass\n\n\nasync
+    def sign_device_path(device_path, options: SignOptions):\n    logging.info(f\"Signing
+    drive {device_path}\")\n    params = []\n    if options.allowEraseWekaPartitions:\n
+    \       params.append(\"--allow-erase-weka-partitions\")\n    if options.allowEraseNonWekaPartitions:\n
+    \       params.append(\"--allow-erase-non-weka-partitions\")\n    if options.allowNonEmptyDevice:\n
+    \       params.append(\"--allow-non-empty-device\")\n    if options.skipTrimFormat:\n
+    \       params.append(\"--skip-trim-format\")\n\n    stdout, stderr, ec = await
+    run_command(\n        f\"/weka-sign-drive {' '.join(params)} -- {device_path}\")\n
+    \   if ec != 0:\n        err = f\"Failed to sign drive {device_path}: {stderr}\"\n
+    \       raise SignException(err)\n\nasync def sign_drives_gke(vendor_id: str,
+    device_id: str, options: dict) -> List[str]:\n    logging.info(\"Signing drives
+    (GKE). Vendor ID: %s, Device ID: %s\", vendor_id, device_id)\n\n    if not vendor_id
+    or not device_id:\n        raise ValueError(\"Vendor ID and Device ID are required\")\n\n
+    \   cmd = f\"\"\"for dev in /sys/block/*; do\nif [ -f \"$dev/device/device/vendor\"
+    ] &&\n   [ \"$(cat $dev/device/device/vendor 2>/dev/null)\" = \"{vendor_id}\"
+    ] &&\n   [ \"$(cat $dev/device/device/device 2>/dev/null)\" = \"{device_id}\"
+    ]; then\n    echo $(basename $dev)\nfi\ndone\"\"\"\n\n    stdout, stderr, ec =
+    await run_command(cmd)\n    if ec != 0:\n        return\n\n    logging.info(f\"Found
+    {len(stdout.decode().strip().split())} drives to sign\")\n    signed_drives =
+    []\n    dev_devices = stdout.decode().strip().split(\"\\n\")\n    for dev_device
+    in dev_devices:\n        device = f\"/dev/{dev_device}\"\n        try:\n            await
+    sign_device_path(device, options)\n            signed_drives.append(device)\n\n
+    \       except SignException as e:\n            logging.error(str(e))\n            continue\n
+    \   return signed_drives\n\nasync def sign_drives(instruction: dict) -> List[str]:\n
+    \   type = instruction['type']\n    options = SignOptions(**instruction.get('options',
+    {})) if instruction.get('options') else SignOptions()\n\n    if type == \"aws-all\":\n
+    \       return await sign_drives_by_pci_info(\n            vendor_id=AWS_VENDOR_ID,\n
+    \           device_id=AWS_DEVICE_ID,\n            options=options\n        )\n
+    \   elif type == \"gcp-all\":\n        return await sign_drives_gke(\n            vendor_id=GCP_VENDOR_ID,\n
+    \           device_id=GCP_DEVICE_ID,\n            options=options\n    )\n    elif
+    type == \"device-identifiers\":\n        return await sign_drives_by_pci_info(\n
+    \           vendor_id=instruction.get('pciDevices', {}).get('vendorId'),\n            device_id=instruction.get('pciDevices',
+    {}).get('deviceId'),\n            options=options\n        )\n    elif type ==
+    \"all-not-root\":\n        return await sign_not_mounted(options)\n    elif type
+    == \"device-paths\":\n        return await sign_device_paths(instruction['devicePaths'],
+    options)\n    else:\n        raise ValueError(f\"Unknown instruction type: {type}\")\n\n\nasync
+    def force_resign_drives_by_paths(devices_paths: List[str]):\n    logging.info(\"Force
+    resigning drives by paths: %s\", devices_paths)\n    signed_drives = []\n    options
+    = SignOptions(allowEraseWekaPartitions=True)\n    for device_path in devices_paths:\n
+    \       try:\n            await sign_device_path(device_path, options)\n            signed_drives.append(device_path)\n
+    \       except SignException as e:\n            logging.error(str(e))\n            continue\n
+    \   write_results(dict(\n        err=None,\n        drives=signed_drives\n    ))\n\n\nasync
+    def force_resign_drives_by_serials(serials: List[str]):\n    logging.info(\"Force
+    resigning drives by serials: %s\", serials)\n    device_paths = []\n    for serial
+    in serials:\n        device_path = await get_block_device_path_by_serial(serial)\n
+    \       device_paths.append(device_path)\n\n    await force_resign_drives_by_paths(device_paths)\n\n\nasync
+    def get_block_device_path_by_serial(serial: str):\n    logging.info(f\"Getting
+    block device path by serial {serial}\")\n    stdout, stderr, ec = await run_command(\n
+    \       \"lsblk -dpno NAME | grep -w $(basename $(ls -la /dev/disk/by-id/ | grep
+    -m 1 \" + serial + \" | awk '{print $NF}'))\")\n    if ec != 0:\n        logging.error(f\"Failed
+    to get block device path by serial {serial}: {stderr}\")\n        return\n    device_path
+    = stdout.decode().strip()\n    return device_path\n\n\nasync def discover_drives():\n
+    \   drives = await find_weka_drives()\n    raw_disks = await find_disks()\n    write_results(dict(\n
+    \       err=None,\n        drives=drives,\n        raw_drives=[asdict(d) for d
+    in raw_disks],\n    ))\n\n\nasync def find_weka_drives():\n    drives = []\n    #
+    ls /dev/disk/by-path/pci-0000\\:03\\:00.0-scsi-0\\:0\\:3\\:0  | ssd\n\n    devices_by_id
+    = subprocess.check_output(\"ls /dev/disk/by-id/\", shell=True).decode().strip().split()\n
+    \   if os.path.exists(\"/dev/disk/by-path\"):\n        devices_by_path = subprocess.check_output(\"ls
+    /dev/disk/by-path/\", shell=True).decode().strip().split()\n    else:\n        devices_by_path
+    = []\n\n    part_names = []\n\n    def resolve_to_part_name():\n        # TODO:
+    A bit dirty, consolidate paths\n        for device in devices_by_path:\n            try:\n
+    \               part_name = subprocess.check_output(f\"basename $(readlink -f
+    /dev/disk/by-path/{device})\",\n                                                    shell=True).decode().strip()\n
+    \           except subprocess.CalledProcessError:\n                logging.error(f\"Failed
+    to get part name for {device}\")\n                continue\n            part_names.append(part_name)\n
+    \       for device in devices_by_id:\n            try:\n                part_name
+    = subprocess.check_output(f\"basename $(readlink -f /dev/disk/by-id/{device})\",\n
+    \                                                   shell=True).decode().strip()\n
+    \               if part_name in part_names:\n                    continue\n            except
+    subprocess.CalledProcessError:\n                logging.error(f\"Failed to get
+    part name for {device}\")\n                continue\n            part_names.append(part_name)\n\n
+    \   resolve_to_part_name()\n\n    logging.info(f\"All found in kernel block devices:
+    {part_names}\")\n    for part_name in part_names:\n        try:\n            type_id
+    = subprocess.check_output(f\"blkid -s PART_ENTRY_TYPE -o value -p /dev/{part_name}\",\n
+    \                                             shell=True).decode().strip()\n        except
+    subprocess.CalledProcessError:\n            logging.error(f\"Failed to get PART_ENTRY_TYPE
+    for {part_name}\")\n            continue\n\n        if type_id == \"993ec906-b4e2-11e7-a205-a0a8cd3ea1de\":\n
+    \           # TODO: Read and populate actual weka guid here\n            weka_guid
+    = \"\"\n            # resolve block_device to serial id\n            pci_device_path
+    = subprocess.check_output(f\"readlink -f /sys/class/block/{part_name}\",\n                                                      shell=True).decode().strip()\n
+    \           if \"nvme\" in part_name:\n                # 3 directories up is the
+    serial id\n                serial_id_path = \"/\".join(pci_device_path.split(\"/\")[:-2])
+    + \"/serial\"\n                serial_id = subprocess.check_output(f\"cat {serial_id_path}\",
+    shell=True).decode().strip()\n                device_path = \"/dev/\" + pci_device_path.split(\"/\")[-2]\n
+    \               if is_google_cos():\n                    serial_id = await get_serial_id_cos_specific(os.path.basename(device_path))\n
+    \           else:\n                device_name = pci_device_path.split(\"/\")[-2]\n
+    \               device_path = \"/dev/\" + device_name\n                dev_index
+    = subprocess.check_output(f\"cat /sys/block/{device_name}/dev\", shell=True).decode().strip()\n
+    \               serial_id_cmd = f\"cat /host/run/udev/data/b{dev_index} | grep
+    ID_SERIAL=\"\n                serial_id = subprocess.check_output(serial_id_cmd,
+    shell=True).decode().strip().split(\"=\")[-1]\n\n            drives.append({\n
+    \               \"partition\": \"/dev/\" + part_name,\n                \"block_device\":
+    device_path,\n                \"serial_id\": serial_id,\n                \"weka_guid\":
+    weka_guid\n            })\n\n    return drives\n\n\ndef is_google_cos():\n    return
+    OS_DISTRO == OS_NAME_GOOGLE_COS\n\n\ndef is_rhcos():\n    return OS_DISTRO ==
+    OS_NAME_REDHAT_COREOS\n\n\ndef wait_for_syslog():\n    while not os.path.isfile('/var/run/syslog-ng.pid'):\n
+    \       time.sleep(0.1)\n        print(\"Waiting for syslog-ng to start\")\n\n\ndef
+    wait_for_agent():\n    while not os.path.isfile('/var/run/weka-agent.pid'):\n
+    \       time.sleep(1)\n        print(\"Waiting for weka-agent to start\")\n\n\nasync
+    def ensure_drivers():\n    logging.info(\"waiting for drivers\")\n    drivers
+    = \"wekafsio wekafsgw mpin_user\".split()\n    if not is_google_cos():\n        drivers.append(\"igb_uio\")\n
+    \       if version_params.get('uio_pci_generic') is not False:\n            drivers.append(\"uio_pci_generic\")\n
+    \   driver_mode = await is_legacy_driver_cmd()\n    logging.info(f\"validating
+    drivers in mode {MODE}, driver mode: {driver_mode}\")\n    if not await is_legacy_driver_cmd()
+    and MODE in [\"client\", \"s3\",\n                                                     \"nfs\"]:
+    \ # we are not using legacy driver on backends, as it should not be validating
+    specific versions, so just lsmoding\n        while not exiting:\n            version
+    = await get_weka_version()\n            stdout, stderr, ec = await run_command(f\"weka
+    driver ready --without-agent --version {version}\")\n            if ec != 0:\n
+    \               with open(\"/tmp/weka-drivers.log_tmp\", \"w\") as f:\n                    f.write(\"weka-drivers-loading\")\n
+    \                   logging.warning(f\"Drivers are not loaded, waiting for them\")\n
+    \               os.rename(\"/tmp/weka-drivers.log_tmp\", \"/tmp/weka-drivers.log\")\n
+    \               logging.error(f\"Failed to validate drivers {stderr.decode('utf-8')}:
+    exc={ec}\")\n                await asyncio.sleep(1)\n                continue\n
+    \           logging.info(\"drivers are ready\")\n            break\n    else:\n
+    \       for driver in drivers:\n            while True:\n                stdout,
+    stderr, ec = await run_command(f\"lsmod | grep -w {driver}\")\n                if
+    ec == 0:\n                    break\n                # write driver name into
+    /tmp/weka-drivers.log\n                logging.info(f\"Driver {driver} not loaded,
+    waiting for it\")\n                with open(\"/tmp/weka-drivers.log_tmp\", \"w\")
+    as f:\n                    logging.warning(f\"Driver {driver} not loaded, waiting
+    for it\")\n                    f.write(driver)\n                os.rename(\"/tmp/weka-drivers.log_tmp\",
+    \"/tmp/weka-drivers.log\")\n                await asyncio.sleep(1)\n                continue\n\n
+    \   with open(\"/tmp/weka-drivers.log_tmp\", \"w\") as f:\n        f.write(\"\")\n
+    \   os.rename(\"/tmp/weka-drivers.log_tmp\", \"/tmp/weka-drivers.log\")\n    logging.info(\"All
+    drivers loaded successfully\")\n\n\n# This atrocities should be replaced by new
+    weka driver build/publish/download/install functionality\nVERSION_TO_DRIVERS_MAP_WEKAFS
+    = {\n    \"4.3.1.29791-9f57657d1fb70e71a3fb914ff7d75eee-dev\": dict(\n        wekafs=\"cc9937c66eb1d0be-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"6b519d501ea82063\",\n    ),\n
+    \   \"4.3.2.560-842278e2dca9375f84bd3784a4e7515c-dev3\": dict(\n        wekafs=\"1acd22f9ddbda67d-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"6b519d501ea82063\",\n    ),\n
+    \   \"4.3.2.560-842278e2dca9375f84bd3784a4e7515c-dev4\": dict(\n        wekafs=\"1acd22f9ddbda67d-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"6b519d501ea82063\",\n    ),\n
+    \   \"4.3.2.560-842278e2dca9375f84bd3784a4e7515c-dev5\": dict(\n        wekafs=\"1acd22f9ddbda67d-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"6b519d501ea82063\",\n    ),\n
+    \   \"4.3.2.783-f5fe2ec58286d9fa8fc033f920e6c842-dev\": dict(\n        wekafs=\"1cb1639d52a2b9ca-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"6b519d501ea82063\",\n    ),\n
+    \   \"4.3.3.28-k8s-alpha-dev\": dict(\n        wekafs=\"1cb1639d52a2b9ca-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"6b519d501ea82063\",\n    ),\n
+    \   \"4.3.3.28-k8s-alpha-dev2\": dict(\n        wekafs=\"1cb1639d52a2b9ca-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"6b519d501ea82063\",\n    ),\n
+    \   \"4.3.3.28-k8s-alpha-dev3\": dict(\n        wekafs=\"1cb1639d52a2b9ca-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"6b519d501ea82063\",\n    ),\n
+    \   \"4.3.2.783-f5fe2ec58286d9fa8fc033f920e6c842-dev2\": dict(\n        wekafs=\"1cb1639d52a2b9ca-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"6b519d501ea82063\",\n    ),\n
+    \   \"4.3.2.783-f5fe2ec58286d9fa8fc033f920e6c842-dev3\": dict(\n        wekafs=\"1cb1639d52a2b9ca-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"6b519d501ea82063\",\n    ),\n
+    \   \"4.2.7.64-k8so-beta.10\": dict(\n        wekafs=\"1.0.0-995f26b334137fd78d57c264d5b19852-GW_aedf44a11ca66c7bb599f302ae1dff86\",\n
+    \   ),\n    \"4.2.10.1693-251d3172589e79bd4960da8031a9a693-dev\": dict(  # dev
+    4.2.7-based version\n        wekafs=\"1.0.0-995f26b334137fd78d57c264d5b19852-GW_aedf44a11ca66c7bb599f302ae1dff86\",\n
+    \   ),\n    \"4.2.10.1290-e552f99e92504c69126da70e1740f6e4-dev\": dict(\n        wekafs=\"1.0.0-c50570e208c935e9129c9054140ab11a-GW_aedf44a11ca66c7bb599f302ae1dff86\",\n
+    \   ),\n    \"4.2.10-k8so.0\": dict(\n        wekafs=\"1.0.0-c50570e208c935e9129c9054140ab11a-GW_aedf44a11ca66c7bb599f302ae1dff86\",\n
+    \   ),\n    \"4.2.10.1671-363e1e8fcfb1290e061815445e973310-dev\": dict(\n        wekafs=\"1.0.0-c50570e208c935e9129c9054140ab11a-GW_aedf44a11ca66c7bb599f302ae1dff86\",\n
+    \   ),\n    \"4.3.3\": dict(\n        wekafs=\"cbd05f716a3975f7-GW_556972ab1ad2a29b0db5451e9db18748\",\n
+    \       uio_pci_generic=False,\n        dependencies=\"7955984e4bce9d8b\",\n        weka_drivers_handling=False,\n
+    \   ),\n}\n# WEKA_DRIVER_VERSION_OPTIONS = [\n#     \"1.0.0-c50570e208c935e9129c9054140ab11a-GW_aedf44a11ca66c7bb599f302ae1dff86\",\n#
+    \    \"1.0.0-995f26b334137fd78d57c264d5b19852-GW_aedf44a11ca66c7bb599f302ae1dff86\",\n#
+    ]\nIGB_UIO_DRIVER_VERSION = \"weka1.0.2\"\nMPIN_USER_DRIVER_VERSION = \"1.0.1\"\nUIO_PCI_GENERIC_DRIVER_VERSION
+    = \"5f49bb7dc1b5d192fb01b442b17ddc0451313ea2\"\nDEFAULT_DEPENDENCY_VERSION = \"1.0.0-024f0fdaa33ec66087bc6c5631b85819\"\n\nIMAGE_NAME
+    = os.environ.get(\"IMAGE_NAME\")\nDEFAULT_PARAMS = dict(\n    weka_drivers_handling=True,\n
+    \   uio_pci_generic=False,\n)\nversion_params = VERSION_TO_DRIVERS_MAP_WEKAFS.get(os.environ.get(\"IMAGE_NAME\").split(\":\")[-1],
+    DEFAULT_PARAMS)\nif \"4.2.7.64-s3multitenancy.\" in IMAGE_NAME:\n    version_params
+    = dict(\n        wekafs=\"1.0.0-995f26b334137fd78d57c264d5b19852-GW_aedf44a11ca66c7bb599f302ae1dff86\",\n
+    \       mpin_user=\"f8c7f8b24611c2e458103da8de26d545\",\n        igb_uio=\"b64e22645db30b31b52f012cc75e9ea0\",\n
+    \       uio_pci_generic=\"1.0.0-929f279ce026ddd2e31e281b93b38f52\",\n    )\nassert
+    version_params\n\nWEKA_DRIVERS_HANDLING = True if version_params.get(\"weka_drivers_handling\")
+    else False\n\n# Implement the rest of your logic here\nimport asyncio\nimport
+    os\nimport signal\n\nloop = asyncio.get_event_loop()\n\n\nasync def get_weka_version():\n
+    \   files = os.listdir(\"/opt/weka/dist/release\")\n    assert len(files) == 1,
+    Exception(f\"More then one release found: {files}\")\n    version = files[0].partition(\".spec\")[0]\n
+    \   return version\n\n\n@dataclass\nclass ReleaseSpec:\n    feature_flags: Optional[str]
+    = None\n\n\nasync def get_release_spec() -> ReleaseSpec:\n    release_dir = \"/opt/weka/dist/release\"\n
+    \   files = os.listdir(release_dir)\n    assert len(files) == 1, Exception(f\"Expected
+    one release spec file, found: {files}\")\n    spec_file_path = os.path.join(release_dir,
+    files[0])\n\n    with open(spec_file_path, 'r') as f:\n        data = json.load(f)\n\n
+    \   # Get defined fields for ReleaseSpec to avoid TypeError with extra keys in
+    JSON\n    spec_fields = {f.name for f in fields(ReleaseSpec)}\n    # Filter data
+    to include only known fields\n    filtered_data = {k: v for k, v in data.items()
+    if k in spec_fields}\n\n    return ReleaseSpec(**filtered_data)\n\n\nasync def
+    get_feature_flags() -> FeaturesFlags:\n    spec = await get_release_spec()\n    return
+    FeaturesFlags(spec.feature_flags)\n\n\nasync def load_drivers():\n    def should_skip_uio_pci_generic():\n
+    \       return version_params.get('uio_pci_generic') is False or should_skip_uio()\n\n
+    \   def should_skip_uio():\n        return is_google_cos()\n\n    def should_skip_igb_uio():\n
+    \       return should_skip_uio()\n\n    if is_rhcos():\n        if os.path.isdir(\"/hostpath/lib/modules\"):\n
+    \           os.system(\"cp -r /hostpath/lib/modules/* /lib/modules/\")\n\n    if
+    not WEKA_DRIVERS_HANDLING:\n        # LEGACY MODE\n        weka_driver_version
+    = version_params.get('wekafs')\n        download_cmds = [\n            (f\"mkdir
+    -p /opt/weka/dist/drivers\", \"creating drivers directory\"),\n            (\n
+    \               f\"curl -kfo /opt/weka/dist/drivers/weka_driver-wekafsgw-{weka_driver_version}-$(uname
+    -r).$(uname -m).ko {DIST_SERVICE}/dist/v1/drivers/weka_driver-wekafsgw-{weka_driver_version}-$(uname
+    -r).$(uname -m).ko\",\n                \"downloading wekafsgw driver\"),\n            (\n
+    \               f\"curl -kfo /opt/weka/dist/drivers/weka_driver-wekafsio-{weka_driver_version}-$(uname
+    -r).$(uname -m).ko {DIST_SERVICE}/dist/v1/drivers/weka_driver-wekafsio-{weka_driver_version}-$(uname
+    -r).$(uname -m).ko\",\n                \"downloading wekafsio driver\"),\n            (\n
+    \               f\"curl -kfo /opt/weka/dist/drivers/mpin_user-{MPIN_USER_DRIVER_VERSION}-$(uname
+    -r).$(uname -m).ko {DIST_SERVICE}/dist/v1/drivers/mpin_user-{MPIN_USER_DRIVER_VERSION}-$(uname
+    -r).$(uname -m).ko\",\n                \"downloading mpin_user driver\")\n        ]\n
+    \       if not should_skip_igb_uio():\n            download_cmds.append((\n                f\"curl
+    -kfo /opt/weka/dist/drivers/igb_uio-{IGB_UIO_DRIVER_VERSION}-$(uname -r).$(uname
+    -m).ko {DIST_SERVICE}/dist/v1/drivers/igb_uio-{IGB_UIO_DRIVER_VERSION}-$(uname
+    -r).$(uname -m).ko\",\n                \"downloading igb_uio driver\"))\n        if
+    not should_skip_uio_pci_generic():\n            download_cmds.append((\n                f\"curl
+    -kfo /opt/weka/dist/drivers/uio_pci_generic-{UIO_PCI_GENERIC_DRIVER_VERSION}-$(uname
+    -r).$(uname -m).ko {DIST_SERVICE}/dist/v1/drivers/uio_pci_generic-{UIO_PCI_GENERIC_DRIVER_VERSION}-$(uname
+    -r).$(uname -m).ko\",\n                \"downloading uio_pci_generic driver\"))\n\n
+    \       load_cmds = [\n            (\n                f\"lsmod | grep -w wekafsgw
+    || insmod /opt/weka/dist/drivers/weka_driver-wekafsgw-{weka_driver_version}-$(uname
+    -r).$(uname -m).ko\",\n                \"loading wekafsgw driver\"),\n            (\n
+    \               f\"lsmod | grep -w wekafsio || insmod /opt/weka/dist/drivers/weka_driver-wekafsio-{weka_driver_version}-$(uname
+    -r).$(uname -m).ko\",\n                \"loading wekafsio driver\"),\n            (\n
+    \               f\"lsmod | grep -w mpin_user || insmod /opt/weka/dist/drivers/mpin_user-{MPIN_USER_DRIVER_VERSION}-$(uname
+    -r).$(uname -m).ko\",\n                \"loading mpin_user driver\")\n        ]\n
+    \       if not should_skip_uio():\n            load_cmds.append((f\"lsmod | grep
+    -w uio || modprobe uio\", \"loading uio driver\"))\n        if not should_skip_igb_uio():\n
+    \           load_cmds.append((\n                f\"lsmod | grep -w igb_uio ||
+    insmod /opt/weka/dist/drivers/igb_uio-{IGB_UIO_DRIVER_VERSION}-$(uname -r).$(uname
+    -m).ko\",\n                \"loading igb_uio driver\"))\n\n    else:\n        #
+    list directory /opt/weka/dist/version\n        # assert single json file and take
+    json filename\n        version = await get_weka_version()\n        if is_google_cos():\n
+    \           kernelBuildIdArg = f\"--kernel-build-id {OS_BUILD_ID}\"\n        else:\n
+    \           kernelBuildIdArg = \"\"\n\n        download_cmds = [\n            (f\"weka
+    driver download --from '{DIST_SERVICE}' --without-agent --version {version} {kernelBuildIdArg}\",
+    \"Downloading drivers\")\n        ]\n        load_cmds = [\n            (f\"rmmod
+    wekafsio || echo could not unload old wekafsio driver, still trying to proceed\",\n
+    \            \"unloading wekafsio\"),\n            (f\"rmmod wekafsgw || echo
+    could not unload old wekafsgw driver, still trying to proceed\",\n             \"unloading
+    wekafsgw\"),\n            (f\"weka driver install --without-agent --version {version}
+    {kernelBuildIdArg}\", \"loading drivers\"),\n        ]\n    if not should_skip_uio_pci_generic():\n
+    \       load_cmds.append((\n            f\"lsmod | grep -w uio_pci_generic ||
+    insmod /opt/weka/dist/drivers/uio_pci_generic-{UIO_PCI_GENERIC_DRIVER_VERSION}-$(uname
+    -r).$(uname -m).ko\",\n            \"loading uio_pci_generic driver\"))\n\n    #
+    load vfio-pci if not loaded and iommu groups are present\n    cmd = '[ \"$(ls
+    -A /sys/kernel/iommu_groups/)\" ] && lsmod | grep -w vfio_pci || modprobe vfio-pci'\n
+    \   if is_google_cos():\n        cmd = 'lsmod | grep -w vfio_pci || modprobe vfio-pci'\n
+    \   _, stderr, ec = await run_command(cmd)\n    if ec != 0:\n        logging.error(f\"Failed
+    to load vfio-pci {stderr.decode('utf-8')}: exc={ec}, last command: {cmd}\")\n
+    \       raise Exception(f\"Failed to load vfio-pci: {stderr}\")\n\n    logging.info(\"Downloading
+    and loading drivers\")\n    for cmd, desc in download_cmds + load_cmds:\n        logging.info(f\"Driver
+    loading step: {desc}\")\n        stdout, stderr, ec = await run_command(cmd)\n
+    \       if ec != 0:\n            logging.error(f\"Failed to load drivers {stderr.decode('utf-8')}:
+    exc={ec}, last command: {cmd}\")\n            raise Exception(f\"Failed to load
+    drivers: {stderr.decode('utf-8')}\")\n    logging.info(\"All drivers loaded successfully\")\n\n\nasync
+    def copy_drivers():\n    if WEKA_DRIVERS_HANDLING:\n        return\n\n    weka_driver_version
+    = version_params.get('wekafs')\n    assert weka_driver_version\n\n    stdout,
+    stderr, ec = await run_command(dedent(f\"\"\"\n      mkdir -p /opt/weka/dist/drivers\n
+    \     cp /opt/weka/data/weka_driver/{weka_driver_version}/$(uname -r)/wekafsio.ko
+    /opt/weka/dist/drivers/weka_driver-wekafsio-{weka_driver_version}-$(uname -r).$(uname
+    -m).ko\n      cp /opt/weka/data/weka_driver/{weka_driver_version}/$(uname -r)/wekafsgw.ko
+    /opt/weka/dist/drivers/weka_driver-wekafsgw-{weka_driver_version}-$(uname -r).$(uname
+    -m).ko\n\n      cp /opt/weka/data/igb_uio/{IGB_UIO_DRIVER_VERSION}/$(uname -r)/igb_uio.ko
+    /opt/weka/dist/drivers/igb_uio-{IGB_UIO_DRIVER_VERSION}-$(uname -r).$(uname -m).ko\n
+    \     cp /opt/weka/data/mpin_user/{MPIN_USER_DRIVER_VERSION}/$(uname -r)/mpin_user.ko
+    /opt/weka/dist/drivers/mpin_user-{MPIN_USER_DRIVER_VERSION}-$(uname -r).$(uname
+    -m).ko\n      {\"\" if version_params.get('uio_pci_generic') == False else f\"cp
+    /opt/weka/data/uio_generic/{UIO_PCI_GENERIC_DRIVER_VERSION}/$(uname -r)/uio_pci_generic.ko
+    /opt/weka/dist/drivers/uio_pci_generic-{UIO_PCI_GENERIC_DRIVER_VERSION}-$(uname
+    -r).$(uname -m).ko\"}\n    \"\"\"))\n    if ec != 0:\n        logging.info(f\"Failed
+    to copy drivers post build {stderr}: exc={ec}\")\n        raise Exception(f\"Failed
+    to copy drivers post build: {stderr}\")\n    logging.info(\"done copying drivers\")\n\n\nasync
+    def cos_build_drivers():\n    weka_driver_version = version_params[\"wekafs\"]\n
+    \   weka_driver_file_version = weka_driver_version.rsplit(\"-\", 1)[0]\n    mpin_driver_version
+    = version_params[\"mpin_user\"]\n    igb_uio_driver_version = version_params[\"igb_uio\"]\n
+    \   uio_pci_generic_driver_version = version_params.get(\"uio_pci_generic\", \"1.0.0-929f279ce026ddd2e31e281b93b38f52\")\n
+    \   weka_driver_squashfs = f'/opt/weka/dist/image/weka-driver-{weka_driver_file_version}.squashfs'\n
+    \   mpin_driver_squashfs = f'/opt/weka/dist/image/driver-mpin-user-{mpin_driver_version}.squashfs'\n
+    \   igb_uio_driver_squashfs = f'/opt/weka/dist/image/driver-igb-uio-{igb_uio_driver_version}.squashfs'\n
+    \   uio_pci_driver_squashfs = f'/opt/weka/dist/image/driver-uio-pci-generic-{uio_pci_generic_driver_version}.squashfs'\n
+    \   logging.info(f\"Building drivers for Google Container-Optimized OS release
+    {OS_BUILD_ID}\")\n    for cmd, desc in [\n        (f\"apt-get install -y squashfs-tools\",
+    \"installing squashfs-tools\"),\n        (f\"mkdir -p /opt/weka/data/weka_driver/{weka_driver_version}/$(uname
+    -r)\", \"downloading weka driver\"),\n        (f\"mkdir -p /opt/weka/data/mpin_user/{MPIN_USER_DRIVER_VERSION}/$(uname
+    -r)\", \"downloading mpin driver\"),\n        (f\"mkdir -p /opt/weka/data/igb_uio/{IGB_UIO_DRIVER_VERSION}/$(uname
+    -r)\", \"downloading igb_uio driver\"),\n        (f\"mkdir -p /opt/weka/data/uio_generic/{UIO_PCI_GENERIC_DRIVER_VERSION}/$(uname
+    -r)\",\n         \"downloading uio_pci_generic driver\"),\n        (f\"unsquashfs
+    -i -f -d /opt/weka/data/weka_driver/{weka_driver_version}/$(uname -r) {weka_driver_squashfs}\",\n
+    \        \"extracting weka driver\"),\n        (f\"unsquashfs -i -f -d /opt/weka/data/mpin_user/{MPIN_USER_DRIVER_VERSION}/$(uname
+    -r) {mpin_driver_squashfs}\",\n         \"extracting mpin driver\"),\n        (f\"unsquashfs
+    -i -f -d /opt/weka/data/igb_uio/{IGB_UIO_DRIVER_VERSION}/$(uname -r) {igb_uio_driver_squashfs}\",\n
+    \        \"extracting igb_uio driver\"),\n        (\n                f\"unsquashfs
+    -i -f -d /opt/weka/data/uio_generic/{UIO_PCI_GENERIC_DRIVER_VERSION}/$(uname -r)
+    {uio_pci_driver_squashfs}\",\n                \"extracting uio_pci_generic driver\"),\n
+    \       (f\"cd /opt/weka/data/weka_driver/{weka_driver_version}/$(uname -r) &&
+    /devenv.sh -R {OS_BUILD_ID} -m \",\n         \"building weka driver\"),\n        (f\"cd
+    /opt/weka/data/mpin_user/{MPIN_USER_DRIVER_VERSION}/$(uname -r) && /devenv.sh
+    -R {OS_BUILD_ID} -m\",\n         \"building mpin driver\"),\n        (f\"cd /opt/weka/data/igb_uio/{IGB_UIO_DRIVER_VERSION}/$(uname
+    -r) && /devenv.sh -R {OS_BUILD_ID} -m\",\n         \"building igb_uio driver\"),\n
+    \       (\n                f\"cd /opt/weka/data/uio_generic/{UIO_PCI_GENERIC_DRIVER_VERSION}/$(uname
+    -r) && /devenv.sh -R {OS_BUILD_ID} -m\",\n                \"building uio_pci_generic
+    driver\"),\n    ]:\n        logging.info(f\"COS driver building step: {desc}\")\n
+    \       stdout, stderr, ec = await run_command(cmd)\n        if ec != 0:\n            logging.error(f\"Failed
+    to build drivers {stderr}: exc={ec}, last command: {cmd}\")\n            raise
+    Exception(f\"Failed to build drivers: {stderr}\")\n\n    logging.info(\"Done building
+    drivers\")\n\n\ndef parse_cpu_allowed_list(path=\"/proc/1/status\"):\n    with
+    open(path) as file:\n        for line in file:\n            if line.startswith(\"Cpus_allowed_list\"):\n
+    \               return expand_ranges(line.strip().split(\":\\t\")[1])\n    return
+    []\n\n\ndef expand_ranges(ranges_str):\n    ranges = []\n    for part in ranges_str.split(','):\n
+    \       if '-' in part:\n            start, end = map(int, part.split('-'))\n
+    \           ranges.extend(list(range(start, end + 1)))\n        else:\n            ranges.append(int(part))\n
+    \   return ranges\n\n\ndef read_siblings_list(cpu_index):\n    path = f\"/sys/devices/system/cpu/cpu{cpu_index}/topology/thread_siblings_list\"\n
+    \   with open(path) as file:\n        return expand_ranges(file.read().strip())\n\n\n@dataclass\nclass
+    HostInfo:\n    kubernetes_distro = 'k8s'\n    os = 'unknown'\n    os_build_id
+    = ''  # this is either COS build ID OR OpenShift version tag, e.g. 415.92.202406111137-0\n\n
+    \   def is_rhcos(self):\n        return self.os == OS_NAME_REDHAT_COREOS\n\n    def
+    is_cos(self):\n        return self.os == OS_NAME_GOOGLE_COS\n\n\ndef get_host_info():\n
+    \   raw_data = {}\n    ret = HostInfo()\n    with open(\"/hostside/etc/os-release\")
+    as file:\n        for line in file:\n            try:\n                k, v =
+    line.strip().split(\"=\")\n            except ValueError:\n                continue\n
+    \           if v:\n                raw_data[k] = v.strip().replace('\"', '')\n\n
+    \   ret.os = raw_data.get(\"ID\", \"\")\n\n    if ret.is_rhcos():\n        ret.kubernetes_distro
+    = KUBERNETES_DISTRO_OPENSHIFT\n        ret.os_build_id = raw_data.get(\"VERSION\",
+    \"\")\n\n    elif ret.is_cos():\n        ret.kubernetes_distro = KUBERNETES_DISTRO_GKE\n
+    \       ret.os_build_id = raw_data.get(\"BUILD_ID\", \"\")\n    return ret\n\n\n@lru_cache\ndef
+    find_full_cores(n):\n    if CORE_IDS != \"auto\":\n        return list(CORE_IDS.split(\",\"))\n\n
+    \   selected_siblings = []\n\n    available_cores = parse_cpu_allowed_list()\n
+    \   zero_siblings = [] if 0 not in available_cores else read_siblings_list(0)\n\n
+    \   for cpu_index in available_cores:\n        if cpu_index in zero_siblings:\n
+    \           continue\n\n        siblings = read_siblings_list(cpu_index)\n        if
+    all(sibling in available_cores for sibling in siblings):\n            if any(sibling
+    in selected_siblings for sibling in siblings):\n                continue\n            selected_siblings.append(siblings[0])
+    \ # Select one sibling (the first for simplicity)\n            if len(selected_siblings)
+    == n:\n                break\n\n    if len(selected_siblings) < n:\n        logging.error(f\"Error:
+    cannot find {n} full cores\")\n        sys.exit(1)\n    else:\n        return
+    selected_siblings\n\n\nasync def await_agent():\n    start = time.time()\n    agent_timeout
+    = 60 if WEKA_PERSISTENCE_MODE != \"global\" else 1500  # global usually is remote
+    storage and pre-create of logs file might take much longer\n    while start +
+    agent_timeout > time.time():\n        _, _, ec = await run_command(\"weka local
+    ps\")\n        if ec == 0:\n            logging.info(\"Weka-agent started successfully\")\n
+    \           return\n        await asyncio.sleep(0.3)\n        logging.info(\"Waiting
+    for weka-agent to start\")\n    raise Exception(f\"Agent did not come up in {agent_timeout}
+    seconds\")\n\n\nprocesses = {}\n\n\nclass Daemon:\n    def __init__(self, cmd,
+    alias):\n        self.cmd = cmd\n        self.alias = alias\n        self.process
+    = None\n        self.task = None\n\n    async def start(self):\n        logging.info(f\"Starting
+    daemon {self.alias} with cmd {self.cmd}\")\n        self.task = asyncio.create_task(self.monitor())\n
+    \       return self.task\n\n    async def start_process(self):\n        logging.info(f\"Starting
+    process {self.cmd} for daemon {self.alias}\")\n        self.process = await start_process(self.cmd,
+    self.alias)\n        logging.info(f\"Started process {self.cmd} for daemon {self.alias}\")\n\n
+    \   async def stop(self):\n        logging.info(f\"Stopping daemon {self.alias}\")\n
+    \       if self.task:\n            self.task.cancel()\n            try:\n                await
+    self.task\n            except asyncio.CancelledError:\n                pass\n
+    \       await self.stop_process()\n\n    async def stop_process(self):\n        logging.info(f\"Stopping
+    process for daemon {self.alias}\")\n        if self.process:\n            await
+    stop_process(self.process)\n            self.process = None\n            logging.info(f\"Stopped
+    process for daemon {self.alias}\")\n        logging.info(f\"No process found to
+    stop\")\n\n    async def monitor(self):\n        async def with_pause():\n            await
+    asyncio.sleep(3)\n\n        while True:\n            if self.process:\n                if
+    self.is_running():\n                    await with_pause()\n                    continue\n
+    \               else:\n                    logging.info(f\"Daemon {self.alias}
+    is not running\")\n                    await self.stop_process()\n            await
+    self.start_process()\n\n    def is_running(self):\n        if self.process is
+    None:\n            return False\n        running = self.process.returncode is
+    None\n        return running\n\n\nasync def start_process(command, alias=\"\"):\n
+    \   \"\"\"Start a daemon process.\"\"\"\n    # TODO: Check if already exists,
+    not really needed unless actually adding recovery flow\n    # TODO: Logs are basically
+    thrown away into stdout . wrap agent logs as debug on logging level\n    process
+    = await asyncio.create_subprocess_shell(command, preexec_fn=os.setpgrp)\n    #
+    stdout=asyncio.subprocess.PIPE,\n    # stderr=asyncio.subprocess.PIPE)\n    logging.info(f\"Daemon
+    {alias or command} started with PID {process.pid}\")\n    processes[alias or command]
+    = process\n    logging.info(f\"Daemon started with PID {process.pid} for command
+    {command}\")\n    return process\n\n\nasync def run_command(command, capture_stdout=True,
+    log_execution=True, env: dict = None, log_output=True):\n    # TODO: Wrap stdout
+    of commands via INFO via logging\n    if log_execution:\n        logging.info(\"Running
+    command: \" + command)\n    if capture_stdout:\n        pipe = asyncio.subprocess.PIPE\n
+    \   else:\n        pipe = None\n    process = await asyncio.create_subprocess_shell(\"set
+    -e\\n\" + command,\n                                                    stdout=pipe,\n
+    \                                                   stderr=pipe, env=env)\n    stdout,
+    stderr = await process.communicate()\n    if log_execution:\n        logging.info(f\"Command
+    {command} finished with code {process.returncode}\")\n    if stdout and log_output:\n
+    \       logging.info(f\"Command {command} stdout: {stdout.decode('utf-8')}\")\n
+    \   if stderr and log_output:\n        logging.info(f\"Command {command} stderr:
+    {stderr.decode('utf-8')}\")\n    return stdout, stderr, process.returncode\n\n\nasync
+    def run_logrotate():\n    stdout, stderr, ec = await run_command(\"logrotate /etc/logrotate.conf\",
+    log_execution=False)\n    if ec != 0:\n        raise Exception(f\"Failed to run
+    logrotate: {stderr}\")\n\n\nasync def write_logrotate_config():\n    with open(\"/etc/logrotate.conf\",
+    \"w\") as f:\n        f.write(dedent(\"\"\"\n            /var/log/syslog /var/log/errors
+    {\n                size 1M\n                rotate 10\n                missingok\n
+    \               notifempty\n                compress\n                delaycompress\n
+    \               postrotate\n                  if [ -f /var/run/syslog-ng.pid ];
+    then\n                    kill -HUP $(cat /var/run/syslog-ng.pid)\n                  else\n
+    \                   echo \"syslog-ng.pid not found, skipping reload\" >&2\n                  fi\n
+    \               endscript\n            }\n\"\"\"))\n\n\nasync def periodic_logrotate():\n
+    \   while not exiting:\n        await write_logrotate_config()\n        await
+    run_logrotate()\n        await asyncio.sleep(60)\n\n\nasync def autodiscover_network_devices(subnet_str)
+    -> List[str]:\n    \"\"\"Returns comma-separated list of network devices\n    that
+    belong to the given subnet.\n    \"\"\"\n    subnet = ipaddress.ip_network(subnet_str,
+    strict=False)\n    cmd = f\"ip -o addr\"\n    stdout, stderr, ec = await run_command(cmd)\n
+    \   if ec != 0:\n        raise Exception(f\"Failed to discover network devices:
+    {stderr}\")\n    lines = stdout.decode('utf-8').strip().split(\"\\n\")\n    devices
+    = []\n    for line in lines:\n        parts = line.split()\n        if len(parts)
+    < 4:\n            continue\n\n        device_name = parts[1]\n        family =
+    parts[2]\n        ip_with_cidr = parts[3]\n\n        # Only match address families
+    relevant to the subnet version\n        if (subnet.version == 4 and family !=
+    \"inet\") or (subnet.version == 6 and family != \"inet6\"):\n            continue\n\n
+    \       # Strip interface zone ID (e.g., fe80::1%eth0)\n        ip_str = ip_with_cidr.split(\"/\")[0].split(\"%\")[0]\n\n
+    \       try:\n            ip = ipaddress.ip_address(ip_str)\n            if ip
+    in subnet:\n                devices.append(device_name)\n        except ValueError:\n
+    \           continue  # skip invalid IPs\n\n    if not devices:\n        logging.error(f\"No
+    network devices found for subnet {subnet}\")\n    else:\n        logging.info(f\"Discovered
+    network devices for subnet {subnet}: {devices}\")\n    return devices\n\n\nasync
+    def resolve_dhcp_net(device):\n    def subnet_mask_to_prefix_length(subnet_mask):\n
+    \       # Convert subnet mask to binary representation\n        binary_mask =
+    ''.join([bin(int(octet) + 256)[3:] for octet in subnet_mask.split('.')])\n        #
+    Count the number of 1s in the binary representation\n        prefix_length = binary_mask.count('1')\n
+    \       return prefix_length\n\n    def get_netdev_info(device):\n        # Create
+    a socket to communicate with the network interface\n        s = None\n        try:\n
+    \           s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\n            #
+    Get the IP address\n            ip_address = socket.inet_ntoa(fcntl.ioctl(\n                s.fileno(),\n
+    \               0x8915,  # SIOCGIFADDR\n                struct.pack('256s', bytes(device[:15],
+    'utf-8'))\n            )[20:24])\n\n            # Get the netmask\n            netmask
+    = socket.inet_ntoa(fcntl.ioctl(\n                s.fileno(),\n                0x891b,
+    \ # SIOCGIFNETMASK\n                struct.pack('256s', bytes(device[:15], 'utf-8'))\n
+    \           )[20:24])\n            cidr = subnet_mask_to_prefix_length(netmask)\n\n
+    \           # Get the MAC address\n            info = fcntl.ioctl(s.fileno(),
+    0x8927,  # SIOCGIFHWADDR\n                               struct.pack('256s', bytes(device[:15],
+    'utf-8')))\n            mac_address = ':'.join('%02x' % b for b in info[18:24])\n
+    \       finally:\n            if s:\n                s.close()\n\n        return
+    mac_address, ip_address, cidr\n\n    try:\n        mac_address, ip_address, cidr
+    = get_netdev_info(device)\n    except OSError:\n        raise Exception(f\"Failed
+    to get network info for device {device}, no IP address found\")\n\n    return
+    f\"'{mac_address}/{ip_address}/{cidr}'\"\n\n\ndef is_managed_k8s(network_device=None):\n
+    \   if network_device is None:\n        network_device = NETWORK_DEVICE\n\n    return
+    \"aws_\" in network_device or \"oci_\" in network_device\n\n\nasync def create_container():\n
+    \   full_cores = find_full_cores(NUM_CORES)\n    mode_part = \"\"\n    if MODE
+    == \"compute\":\n        mode_part = \"--only-compute-cores\"\n    elif MODE ==
+    \"drive\":\n        mode_part = \"--only-drives-cores\"\n    elif MODE == \"client\":\n
+    \       mode_part = \"--only-frontend-cores\"\n    elif MODE == \"s3\":\n        mode_part
+    = \"--only-frontend-cores\"\n    elif MODE == \"nfs\":\n        mode_part = \"--only-frontend-cores\"\n\n
+    \   core_str = \",\".join(map(str, full_cores))\n    logging.info(f\"Creating
+    container with cores: {core_str}\")\n\n    # read join secret from if file exists
+    /var/run/secrets/weka-operator/operator-user/password\n    join_secret_cmd = \"\"\n
+    \   join_secret_flag = \"\"\n    if os.path.exists(\"/var/run/secrets/weka-operator/operator-user/join-secret\"):\n
+    \       join_secret_flag = \"--join-secret\"\n        if MODE == \"client\":\n
+    \           join_secret_flag = \"--join-token\"\n        join_secret_cmd = \"$(cat
+    /var/run/secrets/weka-operator/operator-user/join-secret)\"\n\n    global NETWORK_DEVICE\n
+    \   if not NETWORK_DEVICE and NETWORK_SELECTORS:\n        devices = await get_devices_by_selectors(NETWORK_SELECTORS)\n
+    \       NETWORK_DEVICE = \",\".join(devices)\n\n    if not NETWORK_DEVICE and
+    SUBNETS:\n        devices = await get_devices_by_subnets(SUBNETS)\n        NETWORK_DEVICE
+    = \",\".join(devices)\n\n    if is_managed_k8s():\n        devices = [dev.replace(\"aws_\",
+    \"\").replace(\"oci_\", \"\") for dev in NETWORK_DEVICE.split(\",\")]\n        net_str
+    = \" \".join([f\"--net {d}\" for d in devices]) + \" --management-ips \" + \",\".join(MANAGEMENT_IPS)\n
+    \   elif ',' in NETWORK_DEVICE:\n        net_str = \" \".join([f\"--net {d}\"
+    for d in NETWORK_DEVICE.split(\",\")])\n    else:\n        if not NETWORK_DEVICE:\n
+    \           raise Exception(\"NETWORK_DEVICE not set\")\n\n        if is_udp():\n
+    \           net_str = f\"--net udp\"\n        else:\n            net_str = f\"--net
+    {NETWORK_DEVICE}\"\n\n    failure_domain = FAILURE_DOMAIN\n\n    # NOTE: client
+    containers are set up in restricted mode by default\n    # (even if you login
+    as administrator from a restricted client, your permissions will be limited to
+    RegularUser level⁠⁠)\n    command = dedent(f\"\"\"\n        weka local setup container
+    --name {NAME} --no-start --disable\\\n        --core-ids {core_str} --cores {NUM_CORES}
+    {mode_part} \\\n        {net_str}  --base-port {PORT} \\\n        {f\"{join_secret_flag}
+    {join_secret_cmd}\" if join_secret_cmd else \"\"} \\\n        {f\"--join-ips {JOIN_IPS}\"
+    if JOIN_IPS else \"\"} \\\n        {f\"--client\" if MODE == 'client' else \"\"}
+    \\\n        {f\"--restricted\" if MODE == 'client' and \"4.2.7.64\" not in IMAGE_NAME
+    else \"\"} \\\n        {f\"--failure-domain {failure_domain}\" if failure_domain
+    else \"\"}\n    \"\"\")\n    logging.info(f\"Creating container with command:
+    {command}\")\n    stdout, stderr, ec = await run_command(command)\n    if ec !=
+    0:\n        raise Exception(f\"Failed to create container: {stderr}\")\n    logging.info(\"Container
+    created successfully\")\n\n\nasync def configure_traces():\n    # {\n    #   \"enabled\":
+    true,\n    #   \"ensure_free_space_bytes\": 3221225472,\n    #   \"freeze_period\":
+    {\n    #     \"end_time\": \"0001-01-01T00:00:00+00:00\",\n    #     \"retention\":
+    0,\n    #     \"start_time\": \"0001-01-01T00:00:00+00:00\"\n    #   },\n    #
+    \  \"retention_type\": \"DEFAULT\",\n    #   \"version\": 1\n    # }\n    global
+    DUMPER_CONFIG_MODE\n    ff = await get_feature_flags()\n    if DUMPER_CONFIG_MODE
+    in [\"auto\", \"\"]:\n        if ff.traces_override_partial_support:\n            DUMPER_CONFIG_MODE
+    = \"partial-override\"\n        else:\n            DUMPER_CONFIG_MODE = \"cluster\"\n\n
+    \   data = dict()\n    if DUMPER_CONFIG_MODE == \"override\":\n        data =
+    dict(enabled=True, ensure_free_space_bytes=int(ENSURE_FREE_SPACE_GB) * 1024 *
+    1024 * 1024,\n                    retention_bytes=int(MAX_TRACE_CAPACITY_GB) *
+    1024 * 1024 * 1024, retention_type=\"BYTES\", version=1,\n                    freeze_period=dict(start_time=\"0001-01-01T00:00:00+00:00\",
+    end_time=\"0001-01-01T00:00:00+00:00\",\n                                       retention=0))\n
+    \   elif DUMPER_CONFIG_MODE == \"partial-override\":\n        data = dict(\n            ensure_free_space_bytes=int(ENSURE_FREE_SPACE_GB)
+    * 1024 * 1024 * 1024,\n            retention_bytes=int(MAX_TRACE_CAPACITY_GB)
+    * 1024 * 1024 * 1024,\n            retention_type=\"BYTES\"\n        )\n\n    if
+    MODE == 'dist':\n        data['enabled'] = False\n        data['retention_bytes']
+    = 1 * 1024 * 1024 * 1024 # value should not be in effect due to enabled=False\n
+    \   data_string = json.dumps(data)\n\n    old_full_location = \"/data/reserved_space/dumper_config.json.override\"\n
+    \   legacy_partial_location = \"/data/reserved_space/dumper_config_overrides.json\"\n
+    \   new_partial_location = \"/traces/config_overrides.json\"\n\n    write_location
+    = old_full_location\n\n    if DUMPER_CONFIG_MODE == \"partial-override\":\n        if
+    ff.traces_override_in_slash_traces:\n            write_location = new_partial_location\n
+    \       else:\n            write_location = legacy_partial_location\n\n    if
+    DUMPER_CONFIG_MODE in [\"override\", \"partial-override\"]:\n        command =
+    dedent(f\"\"\"\n            set -e\n            mkdir -p /opt/weka/k8s-scripts\n
+    \           echo '{data_string}' > /opt/weka/k8s-scripts/dumper_config.json.override\n
+    \           weka local run --container {NAME} mv /opt/weka/k8s-scripts/dumper_config.json.override
+    {write_location}\n            \"\"\")\n    elif DUMPER_CONFIG_MODE == \"cluster\":\n
+    \       command = f\"\"\"\n        weka local run --container {NAME} rm -f {old_full_location}
+    {legacy_partial_location} {new_partial_location}\n        \"\"\"\n    else:\n
+    \       raise Exception(f\"Invalid DUMPER_CONFIG_MODE: {DUMPER_CONFIG_MODE}\")\n\n
+    \   if command:\n        stdout, stderr, ec = await run_command(command)\n        if
+    ec != 0:\n            raise Exception(f\"Failed to configure traces: {stderr}\")\n
+    \   logging.info(\"Traces configured successfully\")\n\n\nasync def ensure_nics(num:
+    int):\n    command = dedent(f\"\"\"\n        set -e\n        mkdir -p /opt/weka/k8s-scripts\n
+    \       weka local run --container {NAME} /weka/go-helpers/cloud-helper ensure-nics
+    -n {num}\n        \"\"\")\n    stdout, stderr, ec = await run_command(command)\n
+    \   if ec != 0:\n        raise Exception(f\"Failed to ensure NICs: {stderr}\")\n
+    \   logging.info(\"Ensured NICs successfully\")\n    write_results(\n        dict(err=None,
+    ensured=True, nics=json.loads(stdout.decode('utf-8').strip())['metadata']['vnics'][1:]))\n\n\nasync
+    def get_containers():\n    current_containers, stderr, ec = await run_command(\"weka
+    local ps --json\")\n    if ec != 0:\n        raise Exception(f\"Failed to list
+    containers: {stderr}\")\n    current_containers = json.loads(current_containers)\n
+    \   return current_containers\n\n\nasync def get_weka_local_resources() -> dict:\n
+    \   resources, stderr, ec = await run_command(f\"weka local resources --container
+    {NAME} --json\", log_output=False)\n    if ec != 0:\n        raise Exception(f\"Failed
+    to get resources: {stderr}\")\n    return json.loads(resources)\n\n\ndef should_recreate_client_container(resources:
+    dict) -> bool:\n    if resources[\"base_port\"] != PORT:\n        return True\n
+    \   if resources.get(\"restricted_client\") is not True:\n        return True\n
+    \   return False\n\n\ndef convert_to_bytes(memory: str) -> int:\n    size_str
+    = memory.upper()\n    match = re.match(r\"(\\d+)([KMGTPE]I?B)\", size_str)\n    if
+    not match:\n        raise ValueError(f\"Invalid size format: {size_str}\")\n\n
+    \   size = int(match.group(1))\n    unit = match.group(2)\n\n    multipliers =
+    {\n        'B': 1,\n        'KB': 10 ** 3,\n        'MB': 10 ** 6,\n        'GB':
+    10 ** 9,\n        'TB': 10 ** 12,\n        'PB': 10 ** 15,\n        'EB': 10 **
+    18,\n        'KIB': 2 ** 10,\n        'MIB': 2 ** 20,\n        'GIB': 2 ** 30,\n
+    \       'TIB': 2 ** 40,\n        'PIB': 2 ** 50,\n        'EIB': 2 ** 60\n    }\n
+    \   return size * multipliers[unit]\n\n\nasync def ensure_weka_container():\n
+    \   current_containers = await get_containers()\n\n    if len(current_containers)
+    == 0:\n        logging.info(\"no pre-existing containers, creating\")\n        #
+    create container\n        if MODE in [\"compute\", \"drive\", \"client\", \"s3\",
+    \"nfs\"]:\n            await create_container()\n        else:\n            raise
+    NotImplementedError(f\"Unsupported mode: {MODE}\")\n\n    full_cores = find_full_cores(NUM_CORES)\n\n
+    \   # reconfigure containers\n    logging.info(\"Container already exists, reconfiguring\")\n
+    \   resources = await get_weka_local_resources()\n\n    if MODE == \"client\"
+    and should_recreate_client_container(resources):\n        logging.info(\"Recreating
+    client container\")\n        await run_command(\"weka local stop --force\", capture_stdout=False)\n
+    \       await run_command(f\"weka local rm --all --force\", capture_stdout=False)\n
+    \       await create_container()\n        resources = await get_weka_local_resources()\n\n
+    \   # TODO: Normalize to have common logic between setup and reconfigure, including
+    between clients and backends\n    if MODE == \"client\" and len(resources['nodes'])
+    != (NUM_CORES + 1):\n        stdout, stderr, ec = await run_command(\n            f\"weka
+    local resources cores -C {NAME} --only-frontend-cores {NUM_CORES} --core-ids {','.join(map(str,
+    full_cores[:NUM_CORES]))}\")\n        if ec != 0:\n            raise Exception(f\"Failed
+    to get frontend cores: {stderr}\")\n\n    # TODO: unite with above block as single
+    getter\n    resources = await get_weka_local_resources()\n\n    if MODE in [\"s3\",
+    \"nfs\"]:\n        resources['allow_protocols'] = True\n    resources['reserve_1g_hugepages']
+    = False\n    resources['excluded_drivers'] = [\"igb_uio\"]\n    resources['memory']
+    = convert_to_bytes(MEMORY)\n    resources['auto_discovery_enabled'] = False\n
+    \   resources[\"ips\"] = MANAGEMENT_IPS\n\n    # resources[\"mask_interrupts\"]
+    = True\n\n    resources['auto_remove_timeout'] = AUTO_REMOVE_TIMEOUT\n\n    cores_cursor
+    = 0\n    for node_id, node in resources['nodes'].items():\n        if \"MANAGEMENT\"
+    in node['roles']:\n            continue\n        if CPU_POLICY == \"shared\":\n
+    \           node['dedicate_core'] = False\n            node['dedicated_mode']
+    = \"NONE\"\n        node['core_id'] = full_cores[cores_cursor]\n        cores_cursor
+    += 1\n\n    # fix/add gateway\n    if NET_GATEWAY:\n        if not is_udp():\n
+    \           # TODO: Multi-nic support with custom gateways\n            # figure
+    out what is meant here ^\n            if len(resources['net_devices']) != 1:\n
+    \               raise Exception(\"Gateway configuration is not supported with
+    multiple or zero NICs\")\n            resources['net_devices'][0]['gateway'] =
+    NET_GATEWAY\n\n    # save resources\n    resources_dir = f\"/opt/weka/data/{NAME}/container/\"\n
+    \   os.makedirs(resources_dir, exist_ok=True)\n    resource_gen = str(uuid.uuid4())\n
+    \   file_name = f\"weka-resources.{resource_gen}.json\"\n    resource_file = os.path.join(resources_dir,
+    file_name)\n    with open(resource_file, \"w\") as f:\n        json.dump(resources,
+    f)\n    # reconfigure containers\n    stdout, stderr, ec = await run_command(f\"\"\"\n
+    \       ln -sf {file_name} /opt/weka/data/{NAME}/container/resources.json\n        ln
+    -sf {file_name} /opt/weka/data/{NAME}/container/resources.json.stable\n        ln
+    -sf {file_name} /opt/weka/data/{NAME}/container/resources.json.staging\n        #
+    at some point weka creates such, basically expecting relative path: 'resources.json.stable
+    -> weka-resources.35fda56d-2ce3-4f98-b77c-a399df0940af.json'\n        # stable
+    flow might not even be used, and should be fixed on wekapp side\n    \"\"\")\n\n
+    \   # cli-based changes\n    cli_changes = False\n    if not is_managed_k8s()
+    and not is_udp():\n        target_devices = set(NETWORK_DEVICE.split(\",\"))\n
+    \       if NETWORK_SELECTORS:\n            target_devices = set(await get_devices_by_selectors(NETWORK_SELECTORS))\n
+    \       if SUBNETS:\n            target_devices = set(await get_devices_by_subnets(SUBNETS))\n
+    \       current_devices = set(dev['device'] for dev in resources['net_devices'])\n
+    \       to_remove = current_devices - target_devices\n        to_add = target_devices
+    - current_devices\n        for device in to_remove:\n            stdout, stderr,
+    ec = await run_command(f\"weka local resources net -C {NAME} remove {device}\")\n
+    \           if ec != 0:\n                raise Exception(f\"Failed to remove net
+    device {device}: {stderr}\")\n        for device in to_add:\n            stdout,
+    stderr, ec = await run_command(f\"weka local resources net -C {NAME} add {device}\")\n
+    \           if ec != 0:\n                raise Exception(f\"Failed to add net
+    device {device}: {stderr}\")\n        cli_changes = cli_changes or len(target_devices.difference(current_devices))\n\n
+    \   # applying cli-based changes\n    if cli_changes:\n        stdout, stderr,
+    ec = await run_command(f\"\"\"\n            ln -sf `readlink /opt/weka/data/{NAME}/container/resources.json.staging`
+    /opt/weka/data/{NAME}/container/resources.json.stable\n            ln -sf `readlink
+    /opt/weka/data/{NAME}/container/resources.json.staging` /opt/weka/data/{NAME}/container/resources.json\n
+    \       \"\"\")\n\n    if ec != 0:\n        raise Exception(f\"Failed to import
+    resources: {stderr} \\n {stdout}\")\n\n\ndef get_boot_id():\n    with open(\"/proc/sys/kernel/random/boot_id\",
+    \"r\") as file:\n        boot_id = file.read().strip()\n    return boot_id\n\n\ndef
+    get_instructions_dir():\n    return f\"/host-binds/shared/instructions/{POD_ID}/{get_boot_id()}\"\n\n\n@dataclass\nclass
+    ShutdownInstructions:\n    allow_force_stop: bool = False\n    allow_stop: bool
+    = False\n\n\nasync def get_shutdown_instructions() -> ShutdownInstructions:\n
+    \   if not POD_ID:  ## back compat mode for when pod was scheduled without downward
+    api\n        return ShutdownInstructions()\n    instructions_dir = get_instructions_dir()\n
+    \   instructions_file = os.path.join(instructions_dir, \"shutdown_instructions.json\")\n\n
+    \   if not os.path.exists(instructions_file):\n        ret = ShutdownInstructions()\n
+    \   else:\n        with open(instructions_file, \"r\") as file:\n            data
+    = json.load(file)\n            ret = ShutdownInstructions(**data)\n\n    if exists(\"/tmp/.allow-force-stop\"):\n
+    \       ret.allow_force_stop = True\n    if exists(\"/tmp/.allow-stop\"):\n        ret.allow_stop
+    = True\n    return ret\n\n\nasync def start_weka_container():\n    stdout, stderr,
+    ec = await run_command(\"weka local start\")\n    if ec != 0:\n        raise Exception(f\"Failed
+    to start container: {stderr}\")\n    logging.info(\"finished applying new config\")\n
+    \   logging.info(f\"Container reconfigured successfully: {stdout.decode('utf-8')}\")\n\n\nasync
+    def configure_persistency():\n    if not os.path.exists(\"/host-binds/opt-weka\"):\n
+    \       return\n\n    command = dedent(f\"\"\"\n        mkdir -p /opt/weka-preinstalled\n
+    \       # --- save weka image data separately\n        mount -o bind /opt/weka
+    /opt/weka-preinstalled\n        # --- WEKA_PERSISTENCE_DIR - is HostPath (persistent
+    volume)\n        # --- put existing drivers from persistent dir to weka-preinstalled\n
+    \       mkdir -p {WEKA_PERSISTENCE_DIR}/dist/drivers\n        mount -o bind {WEKA_PERSISTENCE_DIR}/dist/drivers
+    /opt/weka-preinstalled/dist/drivers\n        mount -o bind {WEKA_PERSISTENCE_DIR}
+    /opt/weka\n        mkdir -p /opt/weka/dist\n        # --- put weka dist back on
+    top\n        mount -o bind /opt/weka-preinstalled/dist /opt/weka/dist\n        #
+    --- make drivers dir persistent\n        mount -o bind {WEKA_PERSISTENCE_DIR}/dist/drivers
+    /opt/weka/dist/drivers\n\n        if [ -d /host-binds/boot-level ]; then\n            BOOT_DIR=/host-binds/boot-level/$(cat
+    /proc/sys/kernel/random/boot_id)/cleanup\n            mkdir -p $BOOT_DIR\n            mkdir
+    -p /opt/weka/external-mounts/cleanup\n            mount -o bind $BOOT_DIR /opt/weka/external-mounts/cleanup\n
+    \       fi\n\n        if [ -d /host-binds/shared ]; then\n            mkdir -p
+    /host-binds/shared/local-sockets\n            mkdir -p /opt/weka/external-mounts/local-sockets\n
+    \           mount -o bind /host-binds/shared/local-sockets /opt/weka/external-mounts/local-sockets\n
+    \       fi\n\n        if [ -f /var/run/secrets/weka-operator/wekahome-cacert/cert.pem
+    ]; then\n            rm -rf /opt/weka/k8s-runtime/vars/wh-cacert\n            mkdir
+    -p /opt/weka/k8s-runtime/vars/wh-cacert/\n            cp /var/run/secrets/weka-operator/wekahome-cacert/cert.pem
+    /opt/weka/k8s-runtime/vars/wh-cacert/cert.pem\n            chmod 400 /opt/weka/k8s-runtime/vars/wh-cacert/cert.pem\n
+    \       fi\n\n        if [ -d /host-binds/shared-configs ]; then\n            ENVOY_DIR=/opt/weka/envoy\n
+    \           EXT_ENVOY_DIR=/host-binds/shared-configs/envoy\n            mkdir
+    -p $ENVOY_DIR\n            mkdir -p $EXT_ENVOY_DIR\n            mount -o bind
+    $EXT_ENVOY_DIR $ENVOY_DIR\n        fi\n\n        mkdir -p {WEKA_K8S_RUNTIME_DIR}\n
+    \       touch {PERSISTENCY_CONFIGURED}\n    \"\"\")\n\n    stdout, stderr, ec
+    = await run_command(command)\n    if ec != 0:\n        raise Exception(f\"Failed
+    to configure persistency: {stdout} {stderr}\")\n\n    logging.info(\"Persistency
+    configured successfully\")\n\n\nasync def ensure_weka_version():\n    cmd = \"weka
+    version | grep '*' || weka version set $(weka version)\"\n    stdout, stderr,
+    ec = await run_command(cmd)\n    if ec != 0:\n        raise Exception(f\"Failed
+    to set weka version: {stderr}\")\n    logging.info(\"Weka version set successfully\")\n\n\nasync
+    def configure_agent(agent_handle_drivers=False):\n    logging.info(f\"reconfiguring
+    agent with handle_drivers={agent_handle_drivers}\")\n    ignore_driver_flag =
+    \"false\" if agent_handle_drivers else \"true\"\n\n    env_vars = dict()\n\n    skip_envoy_setup
+    = \"\"\n    if MODE == \"s3\":\n        skip_envoy_setup = \"sed -i 's/skip_envoy_setup=.*/skip_envoy_setup=true/g'
+    /etc/wekaio/service.conf || true\"\n\n    if MODE == \"envoy\":\n        env_vars['RESTART_EPOCH_WANTED']
+    = str(int(os.environ.get(\"envoy_restart_epoch\", time.time())))\n        env_vars['BASE_ID']
+    = PORT\n\n    expand_condition_mounts = \"\"\n    if MODE in ['envoy', 's3']:\n
+    \       expand_condition_mounts = \",envoy-data\"\n\n    drivers_handling_cmd
+    = f\"\"\"\n    # Check if the last line contains the pattern\n    CONFFILE=\"/etc/wekaio/service.conf\"\n
+    \   PATTERN=\"skip_driver_install\"\n    if tail -n 1 \"$CONFFILE\" | grep -q
+    \"$PATTERN\"; then\n        sed -i '$d' \"$CONFFILE\"\n    fi\n\n\n    #TODO:
+    once moving to 4.3+ only switch to ignore_driver_spec. Problem that 4.2 had it
+    in different category\n    # and check by skip_driver_install is sort of abuse
+    of not anymore existing flag to have something to validate by\n    if ! grep -q
+    \"skip_driver_install\" /etc/wekaio/service.conf; then\n        sed -i \"/\\\\[os\\\\]/a
+    skip_driver_install={ignore_driver_flag}\" /etc/wekaio/service.conf\n        sed
+    -i \"/\\\\[os\\\\]/a ignore_driver_spec={ignore_driver_flag}\" /etc/wekaio/service.conf\n
+    \   else\n        sed -i \"s/skip_driver_install=.*/skip_driver_install={ignore_driver_flag}/g\"
+    /etc/wekaio/service.conf\n    fi\n    sed -i \"s/ignore_driver_spec=.*/ignore_driver_spec={ignore_driver_flag}/g\"
+    /etc/wekaio/service.conf || true\n\n    sed -i \"s@external_mounts=.*@external_mounts=/opt/weka/external-mounts@g\"
+    /etc/wekaio/service.conf || true\n    sed -i \"s@conditional_mounts_ids=.*@conditional_mounts_ids=kube-serviceaccount,etc-hosts,etc-resolv{expand_condition_mounts}@g\"
+    /etc/wekaio/service.conf || true\n    {skip_envoy_setup}\n    \"\"\"\n\n    cmd
+    = dedent(f\"\"\"\n        {drivers_handling_cmd}\n        sed -i 's/cgroups_mode=auto/cgroups_mode=none/g'
+    /etc/wekaio/service.conf || true\n        sed -i 's/override_core_pattern=true/override_core_pattern=false/g'
+    /etc/wekaio/service.conf || true\n        sed -i \"s/port=14100/port={AGENT_PORT}/g\"
+    /etc/wekaio/service.conf || true\n        # sed -i \"s/serve_static=false/serve_static=true/g\"
+    /etc/wekaio/service.conf || true\n        echo '{{\"agent\": {{\"port\": \\'{AGENT_PORT}\\'}}}}'
+    > /etc/wekaio/service.json\n    \"\"\")\n    stdout, stderr, ec = await run_command(cmd,
+    env=env_vars)\n    if ec != 0:\n        raise Exception(f\"Failed to configure
+    agent: {stderr}\")\n\n    if MACHINE_IDENTIFIER is not None:\n        logging.info(f\"Setting
+    machine-id {MACHINE_IDENTIFIER}\")\n        os.makedirs(\"/opt/weka/data/agent\",
+    exist_ok=True)\n        cmd = f\"echo '{MACHINE_IDENTIFIER}' > /opt/weka/data/agent/machine-identifier\"\n
+    \       stdout, stderr, ec = await run_command(cmd)\n        if ec != 0:\n            raise
+    Exception(f\"Failed to set machine-id: {stderr}\")\n    logging.info(\"Agent configured
+    successfully\")\n\n\nasync def override_dependencies_flag():\n    \"\"\"Hard-code
+    the success marker so that the dist container can start\n\n    Equivalent to:\n
+    \       ```sh\n        HARDCODED=1.0.0-024f0fdaa33ec66087bc6c5631b85819\n        mkdir
+    -p /opt/weka/data/dependencies/HARDCODED/$(uname -r)/\n        touch /opt/weka/data/dependencies/HARDCODED/$(uname
+    -r)/successful\n        ```\n    \"\"\"\n    logging.info(\"overriding dependencies
+    flag\")\n    dep_version = version_params.get('dependencies', DEFAULT_DEPENDENCY_VERSION)\n\n
+    \   if WEKA_DRIVERS_HANDLING:\n        cmd = dedent(\"\"\"\n        mkdir -p /opt/weka/data/dependencies\n
+    \       touch /opt/weka/data/dependencies/skip\n        \"\"\")\n    else:\n        cmd
+    = dedent(\n            f\"\"\"\n            mkdir -p /opt/weka/data/dependencies/{dep_version}/$(uname
+    -r)/\n            touch /opt/weka/data/dependencies/{dep_version}/$(uname -r)/successful\n
+    \           \"\"\"\n        )\n    stdout, stderr, ec = await run_command(cmd)\n
+    \   if ec != 0:\n        raise Exception(f\"Failed to override dependencies flag:
+    {stderr}\")\n    logging.info(\"dependencies flag overridden successfully\")\n\n\nasync
+    def ensure_stem_container(name=\"dist\"):\n    logging.info(\"ensuring dist container\")\n\n
+    \   cmd = dedent(f\"\"\"\n        if [ -d /driver-toolkit-shared ]; then\n            #
+    Mounting kernel modules from driver-toolkit-shared to dist container\n            mkdir
+    -p /lib/modules\n            mkdir -p /usr/src\n            mount -o bind /driver-toolkit-shared/lib/modules
+    /lib/modules\n            mount -o bind /driver-toolkit-shared/usr/src /usr/src\n
+    \       fi\n\n        weka local ps | grep {name} || weka local setup container
+    --name {name} --net udp --base-port {PORT} --no-start --disable\n        \"\"\")\n
+    \   stdout, stderr, ec = await run_command(cmd)\n    if ec != 0:\n        raise
+    Exception(f\"Failed to create dist container: {stderr}\")\n\n    logging.info(\"dist
+    container created successfully\")\n    # wait for container to become running\n\n\nasync
+    def start_stem_container():\n    logging.info(\"starting dist container\")\n    #
+    stdout, stderr, ec = await run_command(cmd)\n    # if ec != 0:\n    #     raise
+    Exception(f\"Failed to start dist container: {stderr}\")\n    # ! start_process
+    is deprecated and this is the only place that uses it\n    # TODO: Revalidate
+    if it needed or can be simple run_command(As it should be)\n    # TODO: Still
+    broken! hangs if running \"weka local start\" directly via run_command. zombie
+    process\n    await start_process(\n        \"weka local start\")  # weka local
+    start is not returning, so we need to daemonize it, this is a hack that needs
+    to go away\n    # reason of being stuck: agent tries to authenticate using admin:admin
+    into this stem container, for not known reason\n    logging.info(\"stem container
+    started\")\n\n\nasync def ensure_container_exec():\n    logging.info(\"ensuring
+    container exec\")\n    start = time.time()\n    while True:\n        stdout, stderr,
+    ec = await run_command(f\"weka local exec --container {NAME} -- ls\")\n        if
+    ec == 0:\n            break\n        await asyncio.sleep(1)\n        if time.time()
+    - start > 300:\n            raise Exception(f\"Failed to exec into container in
+    5 minutes: {stderr}\")\n    logging.info(\"container exec ensured\")\n\n\ndef
+    write_results(results):\n    logging.info(\"Writing result into /weka-runtime/results.json,
+    results: \\n%s\", results)\n    os.makedirs(\"/weka-runtime\", exist_ok=True)\n
+    \   with open(\"/weka-runtime/results.json.tmp\", \"w\") as f:\n        json.dump(results,
+    f)\n    os.rename(\"/weka-runtime/results.json.tmp\", \"/weka-runtime/results.json\")\n\n\nasync
+    def discovery():\n    # TODO: We should move here everything else we need to discover
+    per node\n    # This might be a good place to discover drives as well, as long
+    we have some selector to discover by\n    host_info = get_host_info()\n    data
+    = dict(\n        is_ht=len(read_siblings_list(0)) > 1,\n        kubernetes_distro=host_info.kubernetes_distro,\n
+    \       os=host_info.os,\n        os_build_id=host_info.os_build_id,\n        schema=DISCOVERY_SCHEMA,\n
+    \   )\n    write_results(data)\n\n\nasync def install_gsutil():\n    logging.info(\"Installing
+    gsutil\")\n    await run_command(\"curl https://sdk.cloud.google.com | bash -s
+    -- --disable-prompts\")\n    os.environ[\"PATH\"] += \":/root/google-cloud-sdk/bin\"\n
+    \   await run_command(\"gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS\")\n\n\nasync
+    def cleanup_traces_and_stop_dumper():\n    while True:\n        cmd = \"weka local
+    exec supervisorctl status | grep RUNNING\"\n        stdout, stderr, ec = await
+    run_command(cmd)\n        if ec != 0:\n            logging.info(f\"Failed to get
+    supervisorctl status: {stderr}\")\n            await asyncio.sleep(3)\n            continue\n
+    \       break\n\n    stdout, stderr, ec = await run_command(\"\"\"\n    weka local
+    exec supervisorctl stop weka-trace-dumper\n    rm -f /opt/weka/traces/*.shard\n
+    \   \"\"\")\n    if ec != 0:\n        logging.error(f\"Failed to cleanup traces:
+    {stderr}\")\n\n\ndef get_agent_cmd():\n    return f\"exec /usr/bin/weka --agent
+    --socket-name weka_agent_ud_socket_{AGENT_PORT}\"\n\n\ndaemons = {\n\n}\n\n\n#
+    k8s lifecycle/local leadership election\n\n\ndef cos_reboot_machine():\n    logging.warning(\"Rebooting
+    the host\")\n    os.sync()\n    time.sleep(3)  # give some time to log the message
+    and sync\n    os.system(\"echo b > /hostside/proc/sysrq-trigger\")\n\n\nasync
+    def is_secure_boot_enabled():\n    stdout, stderr, ec = await run_command(\"dmesg\")\n
+    \   return \"Secure boot enabled\" in stdout.decode('utf-8')\n\n\nasync def cos_disable_driver_signing_verification():\n
+    \   logging.info(\"Checking if driver signing is disabled\")\n    esp_partition
+    = \"/dev/disk/by-partlabel/EFI-SYSTEM\"\n    mount_path = \"/tmp/esp\"\n    grub_cfg
+    = \"efi/boot/grub.cfg\"\n    sed_cmds = []\n    reboot_required = False\n\n    with
+    open(\"/hostside/proc/cmdline\", 'r') as file:\n        for line in file.readlines():\n
+    \           logging.info(f\"cmdline: {line}\")\n            if \"module.sig_enforce\"
+    in line:\n                if \"module.sig_enforce=1\" in line:\n                    sed_cmds.append(('module.sig_enforce=1',
+    'module.sig_enforce=0'))\n            else:\n                sed_cmds.append(('cros_efi',
+    'cros_efi module.sig_enforce=0'))\n            if \"loadpin.enabled\" in line:\n
+    \               if \"loadpin.enabled=1\" in line:\n                    sed_cmds.append(('loadpin.enabled=1',
+    'loadpin.enabled=0'))\n            else:\n                sed_cmds.append(('cros_efi',
+    'cros_efi loadpin.enabled=0'))\n            if \"loadpin.enforce\" in line:\n
+    \               if \"loadpin.enforce=1\" in line:\n                    sed_cmds.append(('loadpin.enforce=1',
+    'loadpin.enforce=0'))\n            else:\n                sed_cmds.append(('cros_efi',
+    'cros_efi loadpin.enforce=0'))\n    if sed_cmds:\n        logging.warning(\"Must
+    modify kernel parameters\")\n        if WEKA_COS_ALLOW_DISABLE_DRIVER_SIGNING:\n
+    \           logging.warning(\"Node driver signing configuration has changed, NODE
+    WILL REBOOT NOW!\")\n        else:\n            raise Exception(\n                \"Node
+    driver signing configuration must be changed, but WEKA_COS_ALLOW_DISABLE_DRIVER_SIGNING
+    is not set to True. Exiting.\")\n\n        await run_command(f\"mkdir -p {mount_path}\")\n
+    \       await run_command(f\"mount {esp_partition} {mount_path}\")\n        current_path
+    = os.curdir\n        try:\n            os.chdir(mount_path)\n            for sed_cmd
+    in sed_cmds:\n                await run_command(f\"sed -i 's/{sed_cmd[0]}/{sed_cmd[1]}/g'
+    {grub_cfg}\")\n            reboot_required = True\n        except Exception as
+    e:\n            logging.error(f\"Failed to modify kernel cmdline: {e}\")\n            raise\n
+    \       finally:\n            os.chdir(current_path)\n            await run_command(f\"umount
+    {mount_path}\")\n            if reboot_required:\n                cos_reboot_machine()\n
+    \   else:\n        logging.info(\"Driver signing is already disabled\")\n\n\nasync
+    def cos_configure_hugepages():\n    if not is_google_cos():\n        logging.debug(\"Skipping
+    hugepages configuration\")\n        return\n\n    with open(\"/proc/meminfo\",
+    'r') as meminfo:\n        for line in meminfo.readlines():\n            if \"HugePages_Total\"
+    in line:\n                hugepage_count = int(line.split()[1])\n                if
+    hugepage_count > 0:\n                    logging.info(f\"Node already has {hugepage_count}
+    hugepages configured, skipping\")\n                    return\n\n    logging.info(\"Checking
+    if hugepages are set\")\n    esp_partition = \"/dev/disk/by-partlabel/EFI-SYSTEM\"\n
+    \   mount_path = \"/tmp/esp\"\n    grub_cfg = \"efi/boot/grub.cfg\"\n    sed_cmds
+    = []\n    reboot_required = False\n\n    current_path = os.curdir\n    with open(\"/hostside/proc/cmdline\",
+    'r') as file:\n        for line in file.readlines():\n            logging.info(f\"cmdline:
+    {line}\")\n            if \"hugepagesz=\" in line:\n                if \"hugepagesz=1g\"
+    in line.lower() and WEKA_COS_GLOBAL_HUGEPAGE_SIZE == \"2m\":\n                    sed_cmds.append(('hugepagesz=1g',
+    'hugepagesz=2m'))\n                elif \"hugepagesz=2m\" in line.lower() and
+    WEKA_COS_GLOBAL_HUGEPAGE_SIZE == \"1g\":\n                    sed_cmds.append(('hugepagesz=2m',
+    'hugepagesz=1g'))\n            if \"hugepages=\" not in line:\n                #
+    hugepages= is not set at all\n                sed_cmds.append(('cros_efi', f'cros_efi
+    hugepages={WEKA_COS_GLOBAL_HUGEPAGE_COUNT}'))\n            elif f\"hugepages={WEKA_COS_GLOBAL_HUGEPAGE_COUNT}\"
+    not in line and WEKA_COS_ALLOW_HUGEPAGE_CONFIG:\n                # hugepages=
+    is set but not to the desired value, and we are allowed to change it\n                sed_cmds.append(('hugepages=[0-9]+',
+    f'hugepages={WEKA_COS_GLOBAL_HUGEPAGE_COUNT}'))\n            elif f\"hugepages={WEKA_COS_GLOBAL_HUGEPAGE_COUNT}\"
+    not in line and not WEKA_COS_ALLOW_HUGEPAGE_CONFIG:\n                logging.info(f\"Node
+    hugepages configuration is managed externally, skipping\")\n    if sed_cmds:\n
+    \       logging.warning(\"Must modify kernel HUGEPAGES parameters\")\n        if
+    WEKA_COS_ALLOW_HUGEPAGE_CONFIG:\n            logging.warning(\"Node hugepage configuration
+    has changed, NODE WILL REBOOT NOW!\")\n        else:\n            raise Exception(\n
+    \               \"Node hugepage configuration must be changed, but WEKA_COS_ALLOW_HUGEPAGE_CONFIG
+    is not set to True. Exiting.\")\n\n        await run_command(f\"mkdir -p {mount_path}\")\n
+    \       await run_command(f\"mount {esp_partition} {mount_path}\")\n        try:\n
+    \           os.chdir(mount_path)\n            for sed_cmd in sed_cmds:\n                await
+    run_command(f\"sed -i 's/{sed_cmd[0]}/{sed_cmd[1]}/g' {grub_cfg}\")\n            reboot_required
+    = True\n        except Exception as e:\n            logging.error(f\"Failed to
+    modify kernel cmdline: {e}\")\n            raise\n        finally:\n            os.chdir(current_path)\n
+    \           os.sync()\n            await run_command(f\"umount {mount_path}\")\n
+    \           if reboot_required:\n                cos_reboot_machine()\n    else:\n
+    \       logging.info(f\"Hugepages are already configured to {WEKA_COS_GLOBAL_HUGEPAGE_COUNT}x2m
+    pages\")\n\n\nasync def disable_driver_signing():\n    if not is_google_cos():\n
+    \       return\n    logging.info(\"Ensuring driver signing is disabled\")\n    await
+    cos_disable_driver_signing_verification()\n\n\nSOCKET_NAME = '\\0weka_runtime_'
+    + NAME  # Abstract namespace socket\nWEKA_K8S_RUNTIME_DIR = '/opt/weka/k8s-runtime'\nGENERATION_PATH
+    = f'{WEKA_K8S_RUNTIME_DIR}/runtime-generation'\nCURRENT_GENERATION = str(time.time())\nPERSISTENCY_CONFIGURED
+    = f'{WEKA_K8S_RUNTIME_DIR}/persistency-configured'\n\n\ndef is_udp():\n    return
+    NETWORK_DEVICE.lower() == \"udp\" or UDP_MODE\n\n\nasync def write_generation():\n
+    \   while os.path.exists(\"/host-binds/opt-weka\") and not os.path.exists(PERSISTENCY_CONFIGURED):\n
+    \       logging.info(\"Waiting for persistency to be configured\")\n        await
+    asyncio.sleep(1)\n\n    logging.info(\"Writing generation %s\", CURRENT_GENERATION)\n
+    \   os.makedirs(WEKA_K8S_RUNTIME_DIR, exist_ok=True)\n    with open(GENERATION_PATH,
+    'w') as f:\n        f.write(CURRENT_GENERATION)\n    logging.info(\"current generation:
+    %s\", read_generation())\n\n\ndef read_generation():\n    try:\n        with open(GENERATION_PATH,
+    'r') as f:\n            ret = f.read().strip()\n    except Exception as e:\n        logging.debug(\"Failed
+    to read generation: %s\", e)\n        ret = \"\"\n    return ret\n\n\nasync def
+    obtain_lock():\n    server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n
+    \   server.setblocking(False)\n    server.bind(SOCKET_NAME)\n    return server\n\n\n_server
+    = None\n\n\nasync def ensure_envoy_container():\n    logging.info(\"ensuring envoy
+    container\")\n    cmd = dedent(f\"\"\"\n        weka local ps | grep envoy ||
+    weka local setup envoy\n    \"\"\")\n    _, _, ec = await run_command(cmd)\n    if
+    ec != 0:\n        raise Exception(f\"Failed to ensure envoy container\")\n    pass\n\n\ndef
+    write_file(path, content):\n    os.makedirs(os.path.dirname(path), exist_ok=True)\n
+    \   with open(path, 'w') as f:\n        f.write(content)\n\n\nasync def is_port_free(port:
+    int) -> bool:\n    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:\n
+    \       try:\n            s.bind(('localhost', port))\n            return True\n
+    \       except OSError as e:\n            if e.errno == 98:  # Address already
+    in use\n                logging.debug(f\"Port {port} is already in use\")\n                return
+    False\n\n            logging.error(f\"Failed to bind to port {port}: {e}\")\n
+    \           return False\n\n\nasync def get_free_subrange_in_port_range(\n        base_port:
+    int,\n        max_port: int,\n        subrange_size: int,\n        exclude_ports:
+    Optional[List[int]] = None\n) -> Tuple[int, int]:\n    \"\"\"Get a subrange of
+    free ports of size subrange_size in the specified port range.\"\"\"\n    exclude_ports
+    = sorted(exclude_ports or [])\n    free_ports = set()\n    not_free_ports = set()\n\n
+    \   port = base_port\n    while port <= max_port - subrange_size:\n        # Skip
+    any subranges that intersect with exclude_ports\n        for exclude_port in exclude_ports:\n
+    \           if port <= exclude_port < port + subrange_size:\n                port
+    = exclude_port + 1\n                break\n        else:\n            subrange_start
+    = port\n            consecutive_free_count = 0\n\n            for check_port in
+    range(port, port + subrange_size):\n                if check_port in free_ports:\n
+    \                   consecutive_free_count += 1\n                elif check_port
+    in not_free_ports:\n                    break\n                else:\n                    if
+    await is_port_free(check_port):\n                        free_ports.add(check_port)\n
+    \                       consecutive_free_count += 1\n                    else:\n
+    \                       not_free_ports.add(check_port)\n                        break\n\n
+    \           if consecutive_free_count == subrange_size:\n                logging.info(f\"Found
+    free subrange: {subrange_start}-{subrange_start + subrange_size - 1}\")\n                return
+    subrange_start, subrange_start + subrange_size - 1\n\n            # If not all
+    ports in the subrange were free, move to the next port\n            port += 1\n\n
+    \   raise RuntimeError(f\"Could not find a subrange of {subrange_size} free ports
+    in the specified range.\")\n\n\nasync def get_free_port(base_port: int, max_port:
+    int, exclude_ports: Optional[List[int]] = None) -> int:\n    for port in range(base_port,
+    max_port):\n        if exclude_ports and port in exclude_ports:\n            continue\n\n
+    \       if await is_port_free(port):\n            logging.info(f\"Found free port:
+    {port}\")\n            return port\n\n    raise RuntimeError(f\"Failed to find
+    free port in range {base_port}-{max_port}\")\n\n\nasync def ensure_client_ports():\n
+    \   global PORT, AGENT_PORT\n    logging.info(\"Ensuring client ports\")\n\n    if
+    parse_port(PORT) > 0 and parse_port(AGENT_PORT) > 0:  # we got resources via env,
+    so no need to wait here\n        await save_weka_ports_data()\n        return\n\n
+    \   base_port = parse_port(BASE_PORT)\n    port_range = parse_port(PORT_RANGE)\n
+    \   assert base_port > 0, \"BASE_PORT is not set\"\n    max_port = base_port +
+    port_range if port_range > 0 else MAX_PORT\n\n    try:\n        if not parse_port(AGENT_PORT):\n
+    \           p = await get_free_port(base_port, max_port)\n            AGENT_PORT
+    = f'{p}'\n        if not parse_port(PORT):\n            p1, _ = await get_free_subrange_in_port_range(base_port,
+    max_port, WEKA_CONTAINER_PORT_SUBRANGE,\n                                                          exclude_ports=[int(AGENT_PORT)])\n
+    \           PORT = f'{p1}'\n    except RuntimeError as e:\n        raise Exception(f\"Failed
+    to find free ports: {e}\")\n    else:\n        await save_weka_ports_data()\n\n\nasync
+    def save_weka_ports_data():\n    write_file(\"/opt/weka/k8s-runtime/vars/port\",
+    str(PORT))\n    write_file(\"/opt/weka/k8s-runtime/vars/agent_port\", str(AGENT_PORT))\n
+    \   logging.info(f\"PORT={PORT}, AGENT_PORT={AGENT_PORT}\")\n\n\ndef parse_port(port_str:
+    str) -> int:\n    try:\n        return int(port_str)\n    except ValueError:\n
+    \       return 0\n\n\nasync def get_requested_drives():\n    if not os.path.exists(\"/opt/weka/k8s-runtime/resources.json\"):\n
+    \       return []\n    with open(\"/opt/weka/k8s-runtime/resources.json\", \"r\")
+    as f:\n        data = json.load(f)\n    return data.get(\"drives\", [])\n\n\nasync
+    def wait_for_resources():\n    global PORT, AGENT_PORT, RESOURCES, FAILURE_DOMAIN,
+    NETWORK_DEVICE\n\n    if MODE == 'client':\n        await ensure_client_ports()\n\n
+    \   if MODE not in ['drive', 's3', 'compute', 'nfs', 'envoy', 'client']:\n        return\n\n
+    \   logging.info(\"waiting for controller to set resources\")\n\n    while not
+    os.path.exists(\"/opt/weka/k8s-runtime/resources.json\"):\n        logging.info(\"waiting
+    for /opt/weka/k8s-runtime/resources.json\")\n        await asyncio.sleep(3)\n
+    \       if (await get_shutdown_instructions()).allow_stop:\n            raise
+    Exception(\"Shutdown requested\")\n        continue\n\n    # Read and validate
+    the JSON file\n    data = None\n    max_retries = 10\n    retry_count = 0\n    \n
+    \   while data is None and retry_count < max_retries:\n        try:\n            with
+    open(\"/opt/weka/k8s-runtime/resources.json\", \"r\") as f:\n                content
+    = f.read().strip()\n                if not content:\n                    logging.warning(\"resources.json
+    is empty, waiting for content...\")\n                    await asyncio.sleep(3)\n
+    \                   retry_count += 1\n                    continue\n                \n
+    \               data = json.loads(content)\n                break\n        except
+    json.JSONDecodeError as e:\n            logging.warning(f\"Invalid JSON in resources.json
+    (attempt {retry_count + 1}/{max_retries}): {e}\")\n            logging.debug(\"Content
+    of resources.json:\", content)\n            await asyncio.sleep(3)\n            retry_count
+    += 1\n        except Exception as e:\n            logging.error(f\"Error reading
+    resources.json: {e}\")\n            await asyncio.sleep(3)\n            retry_count
+    += 1\n    \n    if data is None:\n        raise Exception(f\"Failed to read valid
+    JSON from resources.json after {max_retries} attempts\")\n\n    logging.info(\"found
+    resources.json: %s\", data)\n    net_devices = \",\".join(data.get(\"netDevices\",
+    []))\n    if net_devices and is_managed_k8s(net_devices):\n        NETWORK_DEVICE
+    = net_devices\n\n    if data.get(\"machineIdentifier\"):\n        logging.info(\"found
+    machineIdentifier override, applying\")\n        global MACHINE_IDENTIFIER\n        MACHINE_IDENTIFIER
+    = data.get(\"machineIdentifier\")\n    if MODE == \"client\":\n        return\n\n
+    \   RESOURCES = data\n    if \"failureDomain\" in data:\n        FAILURE_DOMAIN
+    = data[\"failureDomain\"]\n        logging.info(\"Failure Domain: %s\", FAILURE_DOMAIN)\n
+    \   if parse_port(PORT) == 0 and MODE != 'envoy':\n        PORT = data[\"wekaPort\"]\n
+    \   if parse_port(AGENT_PORT) == 0:\n        AGENT_PORT = data[\"agentPort\"]\n\n
+    \   await save_weka_ports_data()\n\n\nasync def get_single_device_ip(device_name:
+    str = \"default\") -> str:\n    if device_name == \"default\":\n        if IS_IPV6:\n
+    \           cmd = \"ip -6 addr show $(ip -6 route show default | awk '{print $5}'
+    | head -n1) | grep 'inet6 ' | grep global | awk '{print $2}' | cut -d/ -f1\"\n
+    \       else:\n            cmd = \"ip route show default | grep src | awk '/default/
+    {print $9}' | head -n1\"\n    else:\n        if IS_IPV6:\n            # use ULA/GUA
+    address for ipv6 (WEKA does not support link-local addresses)\n            cmd
+    = f\"ip -6 addr show dev {device_name} | grep -E 'inet6 (fd|2)' | head -n1 | awk
+    '{{print $2}}' | cut -d/ -f1\"\n        else:\n            cmd = f\"ip addr show
+    dev {device_name} | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1\"\n\n    stdout,
+    stderr, ec = await run_command(cmd)\n    if ec != 0:\n        raise Exception(f\"Failed
+    to get ip address for device {device_name}: {stderr}\")\n    ip = stdout.decode('utf-8').strip()\n\n
+    \   # try again with a different command for default\n    if not ip and device_name
+    == \"default\":\n        # TODO: support ipv6 in this case\n        if not IS_IPV6:\n
+    \           cmd = \"ip -4 addr show dev $(ip route show default | awk '{print
+    $5}') | grep inet | awk '{print $2}' | cut -d/ -f1\"\n            stdout, stderr,
+    ec = await run_command(cmd)\n            if ec != 0:\n                raise Exception(f\"Failed
+    to get ip address for device {device_name}: {stderr}\")\n            ip = stdout.decode('utf-8').strip()\n\n
+    \   if not ip:\n        raise Exception(f\"Failed to get ip address for device
+    {device_name}\")\n    return ip\n\n\nasync def get_devices_waiting_for_all_subnets_to_have_device(subnets:
+    List[str], timeout: int = 300) -> List[str]:\n    \"\"\"Waits for all subnets
+    to have at least one device.\n    Returns a list of devices found in all subnets.\n
+    \   Raises an exception if any subnet does not have a device after the timeout.\n
+    \   \"\"\"\n    start_time = time.time()\n    while True:\n        all_devices_found
+    = True\n        devices = []\n        for subnet in subnets:\n            devices_for_subnet
+    = await autodiscover_network_devices(subnet)\n            if not devices_for_subnet:\n
+    \               all_devices_found = False\n                logging.info(f\"No
+    devices found for subnet {subnet}, waiting...\")\n                break\n            else:\n
+    \               devices.extend(devices_for_subnet)\n\n        if all_devices_found:\n
+    \           logging.info(\"All subnets have devices. Subnets: %s, Devices: %s\",
+    subnets, devices)\n            return devices\n\n        if time.time() - start_time
+    > timeout:\n            raise Exception(f\"Timeout: Not all subnets have devices
+    after {timeout} seconds.\")\n\n        await asyncio.sleep(5)  # Wait before checking
+    again\n\n\nasync def filter_out_missing_devices(device_names: List[str]) -> List[str]:\n
+    \   \"\"\"Filter out devices that are not available in the system.\"\"\"\n    available_devices
+    = []\n    for device_name in device_names:\n        try:\n            ip = await
+    get_single_device_ip(device_name)\n            if ip:\n                available_devices.append(device_name)\n
+    \       except Exception as e:\n            logging.warning(f\"Device {device_name}
+    is not available: {e}\")\n    return available_devices\n\n\nasync def get_devices_by_subnets(subnets_str:
+    str) -> List[str]:\n    subnets = subnets_str.split(\",\")\n    if not subnets:\n
+    \       raise ValueError(\"No subnets provided or format is incorrect. Expected
+    comma-separated list of subnets.\")\n\n    return await get_devices_waiting_for_all_subnets_to_have_device(subnets)\n\n\nasync
+    def get_devices_by_selectors(selectors_str: str) -> List[str]:\n    devices =
+    []\n    selectors = json.loads(selectors_str)\n    for selector in selectors:\n
+    \       min_devices = selector.get(\"min\", 0)\n        max_devices = selector.get(\"max\",
+    0)\n        device_names = selector.get(\"deviceNames\")\n        subnet = selector.get(\"subnet\")\n\n
+    \       if device_names:\n            device_names = await filter_out_missing_devices(device_names)\n
+    \           if len(device_names) < min_devices:\n                raise Exception(f\"Not
+    enough devices found by deviceNames selector. Expected at least {min_devices},
+    found {len(device_names)}.\")\n\n            if max_devices > 0:\n                device_names
+    = device_names[:max_devices]\n\n            for device_name in device_names:\n
+    \               if device_name not in devices:\n                    devices.append(device_name)\n\n
+    \           continue\n\n        if not subnet:\n            raise Exception(\"Either
+    'deviceNames' or 'subnet' must be provided in the selector.\")\n\n        subnet_devices
+    = await get_devices_waiting_for_all_subnets_to_have_device([subnet])\n        if
+    len(subnet_devices) < min_devices:\n            raise Exception(f\"Not enough
+    devices found in subnet {subnet}. Expected at least {min_devices}, found {len(subnet_devices)}.\")\n\n
+    \       if max_devices > 0:\n            subnet_devices = subnet_devices[:max_devices]\n\n
+    \       for device in subnet_devices:\n            if device not in devices:\n
+    \               devices.append(device)\n\n    logging.info(f\"Devices found by
+    selectors: {devices}\")\n\n    return devices\n\n\nasync def write_management_ips():\n
+    \   \"\"\"Auto-discover management IPs and write them to a file\"\"\"\n    if
+    MODE not in ['drive', 'compute', 's3', 'nfs', 'client']:\n        return\n\n    ipAddresses
+    = []\n\n    if os.environ.get(\"MANAGEMENT_IP\") and is_managed_k8s():\n        ipAddresses.append(os.environ.get(\"MANAGEMENT_IP\"))\n
+    \   elif MANAGEMENT_IPS_SELECTORS:\n        devices = await get_devices_by_selectors(MANAGEMENT_IPS_SELECTORS)\n
+    \       for device in devices:\n            ip = await get_single_device_ip(device)\n
+    \           ipAddresses.append(ip)\n    elif not NETWORK_DEVICE and NETWORK_SELECTORS:\n
+    \       devices = await get_devices_by_selectors(NETWORK_SELECTORS)\n        for
+    device in devices:\n            ip = await get_single_device_ip(device)\n            ipAddresses.append(ip)\n
+    \   elif not NETWORK_DEVICE and SUBNETS:\n        devices = await get_devices_by_subnets(SUBNETS)\n
+    \       for device in devices:\n            ip = await get_single_device_ip(device)\n
+    \           ipAddresses.append(ip)\n    # default udp mode (if network device
+    is not set explicitly)\n    elif is_udp():\n        if NETWORK_DEVICE != 'udp':\n
+    \           ip = await get_single_device_ip(NETWORK_DEVICE)\n        else:\n            ip
+    = await get_single_device_ip()\n        ipAddresses.append(ip)\n    # if single
+    nic is used\n    elif ',' not in NETWORK_DEVICE:\n        ip = await get_single_device_ip(NETWORK_DEVICE)\n
+    \       ipAddresses.append(ip)\n    # if multiple nics are used\n    else:\n        devices
+    = NETWORK_DEVICE.split(\",\")\n        for device in devices:\n            ip
+    = await get_single_device_ip(device)\n            ipAddresses.append(ip)\n\n    if
+    not ipAddresses:\n        raise Exception(\"Failed to discover management IPs\")\n\n
+    \   with open(\"/opt/weka/k8s-runtime/management_ips.tmp\", \"w\") as f:\n        f.write(\"\\n\".join(ipAddresses))\n
+    \   os.rename(\"/opt/weka/k8s-runtime/management_ips.tmp\", \"/opt/weka/k8s-runtime/management_ips\")\n\n
+    \   logging.info(f\"Management IPs: {ipAddresses}\")\n    global MANAGEMENT_IPS\n
+    \   MANAGEMENT_IPS = ipAddresses\n\n\nasync def ensure_drives():\n    sys_drives
+    = await find_weka_drives()\n    requested_drives = RESOURCES.get(\"drives\", [])\n
+    \   drives_to_setup = []\n    for drive in requested_drives:\n        for sd in
+    sys_drives:\n            if sd[\"serial_id\"] == drive:\n                drives_to_setup.append(sd[\"block_device\"])\n
+    \               break\n        # else:\n        #     raise Exception(f\"Drive
+    {drive['serial_id']} not found\")\n\n    # write discovered drives into runtime
+    dir\n    os.makedirs(\"/opt/weka/k8s-runtime\", exist_ok=True)\n    with open(\"/opt/weka/k8s-runtime/drives.json\",
+    \"w\") as f:\n        json.dump([d for d in sys_drives if d['serial_id'] in requested_drives],
+    f)\n    logging.info(f\"sys_drives: {sys_drives}\")\n    logging.info(f\"requested_drives:
+    {requested_drives}\")\n    logging.info(f\"in-kernel drives are: {drives_to_setup}\")\n\n\nis_legacy_driver_command
+    = None\n\n\nasync def is_legacy_driver_cmd() -> bool:\n    global is_legacy_driver_command\n
+    \   if is_legacy_driver_command is not None:\n        return is_legacy_driver_command\n
+    \   cmd = \"weka driver --help | grep pack\"\n    stdout, stderr, ec = await run_command(cmd)\n
+    \   if ec == 0:\n        logging.info(\"Driver pack command is available, new
+    dist mode\")\n        is_legacy_driver_command = False\n        return False\n
+    \   logging.info(\"Driver pack command is not available, legacy dist mode\")\n
+    \   is_legacy_driver_command = True\n    return True\n\n\nasync def pack_drivers():\n
+    \   logging.info(\"Packing drivers\")\n    cmd = \"weka driver pack\"\n    stdout,
+    stderr, ec = await run_command(cmd)\n    if ec != 0:\n        raise Exception(f\"Failed
+    to pack drivers: {stderr}\")\n    logging.info(\"Drivers packed successfully\")\n\n\nasync
+    def run_prerun_script():\n    pre_run_script = os.environ.get(\"PRE_RUN_SCRIPT\")\n
+    \   if not pre_run_script:\n        return\n    # decode base64\n    pre_run_script
+    = base64.b64decode(pre_run_script).decode('utf-8')\n    logging.info(f\"Running
+    pre-run script: {pre_run_script}\")\n    # save script into tmp script file\n
+    \   with open(\"/tmp/pre-run-script.sh\", \"w\") as f:\n        f.write(pre_run_script)\n
+    \   # run script\n    cmd = \"bash /tmp/pre-run-script.sh\"\n    stdout, stderr,
+    ec = await run_command(cmd, capture_stdout=False)\n    if ec != 0:\n        raise
+    Exception(f\"Failed to run pre-run script: {stderr}\")\n\n\nasync def umount_drivers():\n
+    \   # TODO: Should support specific container id\n    logging.info(\"Umounting
+    driver\")\n    find_mounts_cmd = \"nsenter --mount --pid --target 1 -- mount -t
+    wekafs | awk '{print $3}'\"\n    stdout, stderr, ec = await run_command(find_mounts_cmd)\n
+    \   if ec != 0:\n        logging.info(f\"Failed to find weka mounts: {stderr}
+    {stdout}\")\n\n    errs = []\n    umounted_paths = []\n\n    for mount in stdout.decode('utf-8').split(\"\\n\"):\n
+    \       if not mount:\n            continue\n        umount_cmd = f\"nsenter --mount
+    --pid --target 1 -- umount {mount}\"\n        stdout, stderr, ec = await run_command(umount_cmd)\n
+    \       errs.append(stderr)\n        if ec != 0:\n            continue\n        umounted_paths.append(mount)\n\n
+    \   # after umounts without errors we should succeed to rmmod, be that true or
+    not - attempting\n    if len(errs) == 0:\n        stdout, stderr, ec = await run_command(\"\"\"\n
+    \       if lsmod | grep wekafsio; then\n            rmmod wekafsio\n        fi\n
+    \       \"\"\"\n                                               )\n        if ec
+    != 0:\n            errs.append(stderr)\n\n    logging.info(\"weka mounts umounted
+    successfully\")\n    write_results(dict(\n        error=errs,\n        umounted_paths=umounted_paths,\n
+    \   ))\n\n\nasync def main():\n    host_info = get_host_info()\n    global OS_DISTRO,
+    OS_BUILD_ID\n    OS_DISTRO = host_info.os\n    logging.info(f'OS_DISTRO={OS_DISTRO}')\n\n
+    \   OS_BUILD_ID = host_info.os_build_id\n\n    if not OS_BUILD_ID and is_google_cos():\n
+    \       raise Exception(\"OS_BUILD_ID is not set\")\n    if is_google_cos():\n
+    \       logging.info(f'OS_BUILD_ID={OS_BUILD_ID}')\n\n    if MODE == \"discovery\":\n
+    \       # self signal to exit\n        logging.info(\"discovery mode\")\n        await
+    cos_configure_hugepages()\n        await discovery()\n        return\n\n    if
+    MODE == \"drivers-loader\":\n        # self signal to exit\n        await override_dependencies_flag()\n
+    \       # 2 minutes timeout for driver loading\n        end_time = time.time()
+    + 120\n        await disable_driver_signing()\n        loaded = False\n        while
+    time.time() < end_time:\n            try:\n                await load_drivers()\n
+    \               write_results(dict(\n                    err=None,\n                    drivers_loaded=True\n
+    \               ))\n                logging.info(\"Drivers loaded successfully\")\n
+    \               loaded = True\n                return\n            except Exception
+    as e:\n                await asyncio.sleep(5)\n                if time.time()
+    > end_time:\n                    write_results(dict(\n                        err=getattr(e,
+    'message', repr(e)),\n                        drivers_loaded=False,\n                    ))\n
+    \                   # return (not raise) to avoid infinite container restarts
+    in the pod\n                    return\n                logging.exception(\"Failed
+    to load drivers, retrying...\", exc_info=e)\n                logging.info(\"retrying
+    drivers download... will reach timeout in %d seconds\", end_time - time.time())\n
+    \       if not loaded:\n            raise Exception(\"Failed to load drivers\")\n
+    \       return\n\n    await configure_persistency()\n    await wait_for_resources()\n
+    \   await write_generation()  # write own generation to kill other processes\n
+    \   await write_management_ips()\n    global _server\n    _server = await obtain_lock()
+    \ # then waiting for lock with short timeout\n\n    if MODE != \"adhoc-op\":  #
+    this can be specialized container that should not have agent\n        await configure_agent()\n
+    \       syslog = Daemon(\"/usr/sbin/syslog-ng -F -f /etc/syslog-ng/syslog-ng.conf
+    --pidfile /var/run/syslog-ng.pid\",\n                        \"syslog\")\n        await
+    syslog.start()\n\n    await override_dependencies_flag()\n    if MODE not in [\"dist\",
+    \"drivers-dist\", \"drivers-loader\", \"drivers-builder\", \"adhoc-op-with-container\",
+    \"envoy\",\n                    \"adhoc-op\"]:\n        await ensure_drivers()\n\n
+    \   if MODE != \"adhoc-op\":\n        agent_cmd = get_agent_cmd()\n        agent
+    = Daemon(agent_cmd, \"agent\")\n        await agent.start()\n        await await_agent()\n
+    \       await ensure_weka_version()\n\n    if MODE == \"drivers-dist\":\n        #
+    Dist is only serving, we will invoke downloads on it, probably in stand-alone
+    ad-hoc container, but never actually build\n        # if DIST_LEGACY_MODE:\n        logging.info(\"dist-service
+    flow\")\n        await ensure_stem_container(\"dist\")\n        await configure_traces()\n
+    \       await start_stem_container()\n        await cleanup_traces_and_stop_dumper()\n
+    \       return\n\n    if MODE == \"adhoc-op-with-container\":\n        global
+    NAME\n        NAME = \"adhoc\"\n        await ensure_stem_container(NAME)\n        await
+    configure_traces()\n        await start_stem_container()\n        await ensure_container_exec()\n
+    \       instruction = json.loads(INSTRUCTIONS)\n        logging.info(f\"adhoc-op-with-container
+    instruction: {instruction}\")\n        payload = json.loads(instruction['payload'])\n
+    \       if instruction.get('type') == 'ensure-nics':\n            if payload.get('type')
+    in [\"aws\", \"oci\"]:\n                await ensure_nics(payload['dataNICsNumber'])\n
+    \               return\n            else:\n                raise ValueError(f\"Ensure
+    NICs instruction type not supported: {payload.get('type')}\")\n        else:\n
+    \           raise ValueError(f\"unsupported instruction: {instruction.get('type')}\")\n\n
+    \   if MODE == \"adhoc-op\":\n        instruction = json.loads(INSTRUCTIONS)\n
+    \       if instruction.get('type') and instruction['type'] == \"discover-drives\":\n
+    \           await discover_drives()\n        elif instruction.get('type') and
+    instruction['type'] == 'force-resign-drives':\n            logging.info(f\"force-resign-drives
+    instruction: {instruction}\")\n            payload = json.loads(instruction['payload'])\n
+    \           device_paths = payload.get('devicePaths', [])\n            device_serials
+    = payload.get('deviceSerials', [])\n            if device_paths:\n                await
+    force_resign_drives_by_paths(device_paths)\n            elif device_serials:\n
+    \               await force_resign_drives_by_serials(device_serials)\n        elif
+    instruction.get('type') and instruction['type'] == 'sign-drives':\n            logging.info(f\"sign-drives
+    instruction: {instruction}\")\n            payload = json.loads(instruction['payload'])\n
+    \           signed_drives = await sign_drives(payload)\n            logging.info(f\"signed_drives:
+    {signed_drives}\")\n            await asyncio.sleep(3)  # a hack to give kernel
+    a chance to update paths, as it's not instant\n            await discover_drives()\n
+    \       elif instruction.get('type') and instruction['type'] == 'debug':\n            #
+    TODO: Wrap this as conditional based on payload, as might fail in some cases\n
+    \           raw_disks = await find_disks()\n            logging.info(f\"Raw disks:
+    {raw_disks}\")\n        # TODO: Should we support generic command proxy? security
+    concern?\n        elif instruction.get('type') and instruction['type'] == 'umount':\n
+    \           logging.info(f\"umounting wekafs mounts\")\n            await umount_drivers()\n
+    \       else:\n            raise ValueError(f\"Unsupported instruction: {INSTRUCTIONS}\")\n
+    \       return\n\n    # de-facto, both drivers-builder and dist right now are
+    doing \"build and serve\"\n    if MODE in [\"dist\", \"drivers-builder\"]:\n        DIST_LEGACY_MODE
+    = await is_legacy_driver_cmd()\n        logging.info(\"dist-service flow\")\n
+    \       if is_google_cos():\n            await install_gsutil()\n            await
+    cos_build_drivers()\n\n        elif DIST_LEGACY_MODE:  # default\n            await
+    agent.stop()\n            await configure_agent(agent_handle_drivers=True)\n            await
+    agent.start()  # here the build happens\n            await await_agent()\n\n        await
+    ensure_stem_container(\"dist\")\n        await configure_traces()\n        if
+    not DIST_LEGACY_MODE:\n            # there might be a better place for preRunScript,
+    but it is needed just for driver now\n            await run_prerun_script()\n
+    \           await pack_drivers()  # explicit pack of drivers if supported, which
+    is new method, that should become default with rest of code removed eventually\n
+    \       else:\n            await agent.stop()\n            await configure_agent(agent_handle_drivers=False)\n
+    \           await agent.start()\n            await await_agent()\n\n        if
+    DIST_LEGACY_MODE:\n            await copy_drivers()\n        await start_stem_container()\n
+    \       await cleanup_traces_and_stop_dumper()\n        weka_version, _, _ = await
+    run_command(\"weka version current\")\n        write_results(\n            {\n
+    \               \"driver_built\": True,\n                \"err\": \"\",\n                \"weka_version\":
+    weka_version.decode().strip(),\n                \"kernel_signature\": await get_kernel_signature(weka_pack_supported=not
+    DIST_LEGACY_MODE,\n                                                               weka_drivers_handling=WEKA_DRIVERS_HANDLING),\n
+    \               \"weka_pack_not_supported\": DIST_LEGACY_MODE,\n                \"no_weka_drivers_handling\":
+    not WEKA_DRIVERS_HANDLING,\n            })\n        return\n\n    if MODE == \"envoy\":\n
+    \       await ensure_envoy_container()\n        return\n\n    await ensure_weka_container()\n
+    \   await configure_traces()\n    await start_weka_container()\n    await ensure_container_exec()\n
+    \   logging.info(\"Container is UP and running\")\n    if MODE == \"drive\":\n
+    \       await ensure_drives()\n\n\nasync def get_kernel_signature(weka_pack_supported=False,
+    weka_drivers_handling=False):\n    if not weka_drivers_handling:\n        return
+    \"\"\n\n    cmd = \"\"\n    if weka_pack_supported:\n        cmd = \"weka driver
+    kernel 2>&1 | awk '{printf \\\"%s\\\", $NF}'\"\n    else:\n        # tr -d '\\0'
+    is needed to remove null character from the end of output\n        cmd = \"weka
+    driver kernel-sig 2>&1 | awk '{printf \\\"%s\\\", $NF}' | tr -d '\\\\0'\"\n\n
+    \   stdout, stderr, ec = await run_command(cmd)\n    if ec != 0:\n        raise
+    Exception(f\"Failed to get kernel signature: {stderr}\")\n\n    res = stdout.decode().strip()\n
+    \   assert res, \"Kernel signature not found\"\n    return res\n\n\nasync def
+    stop_process(process):\n    logging.info(f\"stopping daemon with pid {process.pid}
+    (via process group), {process}\")\n\n    async def cleanup_process():\n        for
+    k, v in list(processes.items()):\n            if v == process:\n                logging.info(f\"removing
+    process {k}\")\n                del processes[k]\n        logging.info(f\"waiting
+    for process {process.pid} to exit\")\n        await process.wait()\n        logging.info(f\"process
+    {process.pid} exited\")\n\n    if process.returncode is not None:\n        await
+    cleanup_process()\n        return\n\n    pgid = os.getpgid(process.pid)\n    logging.info(f\"stopping
+    process group {pgid}\")\n    os.killpg(pgid, signal.SIGTERM)\n    logging.info(f\"process
+    group {pgid} stopped\")\n    await cleanup_process()\n\n\ndef is_wrong_generation():\n
+    \   if MODE in ['drivers-loader', 'discovery']:\n        return False\n\n    current_generation
+    = read_generation()\n    if current_generation == \"\":\n        return False\n\n
+    \   if current_generation != CURRENT_GENERATION:\n        logging.error(\"Wrong
+    generation detected, exiting, current:%s, read: %s\", CURRENT_GENERATION, read_generation())\n
+    \       return True\n    return False\n\n\nasync def takeover_shutdown():\n    while
+    not is_wrong_generation():\n        await asyncio.sleep(1)\n\n    logging.info(\"takeover_shutdown
+    called\")\n    await run_command(\"weka local stop --force\", capture_stdout=False)\n\n\ndef
+    get_active_mounts(file_path=\"/proc/wekafs/interface\") -> int:\n    \"\"\"Get
+    the number of active mounts from the specified file.\n    Return -1 if the number
+    of active mounts cannot be determined.\n    \"\"\"\n    try:\n        with open(file_path,
+    \"r\") as file:\n            for line in file:\n                if line.startswith(\"Active
+    mounts:\"):\n                    # Extract the number after \"Active mounts:\"\n
+    \                   return int(line.split(\":\")[1].strip())\n    except FileNotFoundError:\n
+    \       logging.error(f\"File '{file_path}' not found.\")\n    except ValueError:\n
+    \       logging.error(f\"Failed to parse the number of active mounts.\")\n    except
+    Exception as e:\n        logging.error(f\"Failed to get the number of active mounts:
+    {e}\")\n    return -1\n\n\nasync def wait_for_shutdown_instruction():\n    while
+    True:\n        shutdown_instructions = await get_shutdown_instructions()\n\n        if
+    shutdown_instructions.allow_force_stop:\n            logging.info(\"Received 'allow-force-stop'
+    instruction\")\n            return\n        if shutdown_instructions.allow_stop:\n
+    \           logging.info(\"Received 'allow-stop' instruction\")\n            return\n\n
+    \       logging.info(\"Waiting for shutdown instruction...\")\n        await asyncio.sleep(5)\n\n\nasync
+    def watch_for_force_shutdown():\n    while True:\n        if (await get_shutdown_instructions()).allow_force_stop:\n
+    \           logging.info(\"Received 'allow-force-stop' instruction\")\n            await
+    run_command(\"weka local stop --force\", capture_stdout=False)\n            return\n
+    \       await asyncio.sleep(5)\n\n\nasync def is_container_running(no_agent_as_not_running=False):\n
+    \   try:\n        containers = await get_containers()\n    except Exception as
+    e:\n        if no_agent_as_not_running:\n            logging.exception(\"agent
+    error, due to force stop - assuming container is not running\")\n            return
+    False\n        else:\n            logging.exception(\"agent error, since no force
+    stop - assuming container is running\")\n            return True\n    for container
+    in containers:\n        if container['name'] == NAME:\n            if container['runStatus']
+    == \"Stopped\":\n                return False\n            return True\n    return
+    False\n\n\nasync def shutdown():\n    global exiting\n    while not (exiting or
+    is_wrong_generation()):\n        await asyncio.sleep(1)\n        continue\n\n
+    \   logging.warning(\"Received signal, stopping all processes\")\n    exiting
+    = True  # multiple entry points of shutdown, exiting is global check for various
+    conditions\n\n    if MODE not in [\"drivers-loader\", \"discovery\", \"ensure-nics\"]:\n
+    \       if MODE in [\"client\", \"s3\", \"nfs\", \"drive\", \"compute\"]:\n            await
+    wait_for_shutdown_instruction()\n\n        force_stop = False\n        if (await
+    get_shutdown_instructions()).allow_force_stop:\n            force_stop = True\n
+    \       if is_wrong_generation():\n            force_stop = True\n        if MODE
+    not in [\"s3\", \"drive\", \"compute\", \"nfs\"]:\n            force_stop = True\n
+    \       stop_flag = \"--force\" if force_stop else \"-g\"\n\n        force_shutdown_task
+    = None\n        if \"--force\" not in stop_flag:\n            force_shutdown_task
+    = asyncio.create_task(watch_for_force_shutdown())\n\n        while await is_container_running(no_agent_as_not_running=force_stop):\n
+    \           await run_command(f\"weka local stop {stop_flag}\", capture_stdout=False)\n
+    \       if force_shutdown_task is not None:\n            force_shutdown_task.cancel()\n
+    \       logging.info(\"finished stopping weka container\")\n\n    if MODE == \"drive\":\n
+    \       timeout = 60\n        # print out in-kernel devices for up to 60 seconds
+    every 0.3 seconds\n        requested_drives = await get_requested_drives()\n        logging.info(f\"Waiting
+    for {len(requested_drives)} requested drives to return to kernel: {requested_drives}\")\n\n
+    \       for _ in range(int(timeout / 0.3)):\n            drives = await find_weka_drives()\n
+    \           logging.info(f\"Found {len(drives)}: {drives}\")\n            in_kernel_drives_serials
+    = [d['serial_id'] for d in drives]\n\n            requested_drives_returned =
+    True\n            for requested_serial in requested_drives:\n                if
+    requested_serial not in in_kernel_drives_serials:\n                    logging.info(f\"Requested
+    drive {requested_serial} not found in kernel drives\")\n                    requested_drives_returned
+    = False\n\n            if requested_drives_returned:\n                logging.info(\"All
+    requested drives returned to kernel\")\n                break\n\n            await
+    asyncio.sleep(0.3)\n\n    for key, process in dict(processes.items()).items():\n
+    \       logging.info(f\"stopping process {process.pid}, {key}\")\n        await
+    stop_process(process)\n        logging.info(f\"process {process.pid} stopped\")\n\n
+    \   tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task(loop)]\n
+    \   [task.cancel() for task in tasks]\n\n    logging.info(\"All processes stopped,
+    stopping main loop\")\n    loop.stop()\n    logging.info(\"Main loop stopped\")\n\n\nexiting
+    = False\n\n\ndef signal_handler(sig):\n    global exiting\n    logging.info(f\"Received
+    signal {sig}\")\n    exiting = True\n\n\ndef reap_zombies():\n    # agent leaves
+    zombies behind on weka local start\n    while True:\n        time.sleep(1)\n        try:\n
+    \           # Wait for any child process, do not block\n            pid, _ = os.waitpid(-1,
+    os.WNOHANG)\n            if pid == 0:  # No zombie to reap\n                continue\n
+    \       except ChildProcessError:\n            # No child processes\n            continue\n\n\nzombie_collector
+    = threading.Thread(target=reap_zombies, daemon=True)\nzombie_collector.start()\n\n#
+    Setup signal handler for graceful shutdown\nloop.add_signal_handler(signal.SIGINT,
+    partial(signal_handler, \"SIGINT\"))\nloop.add_signal_handler(signal.SIGTERM,
+    partial(signal_handler, \"SIGTERM\"))\n\nshutdown_task = loop.create_task(shutdown())\ntakeover_shutdown_task
+    = loop.create_task(takeover_shutdown())\n\nmain_loop = loop.create_task(main())\nif
+    MODE not in [\"adhoc-op\"]:\n    logrotate_task = loop.create_task(periodic_logrotate())\n\n\ntry:\n
+    \   try:\n        loop.run_until_complete(main_loop)\n        loop.run_forever()\n
+    \   except RuntimeError:\n        if exiting:\n            logging.info(\"Cancelled\")\n
+    \       else:\n            raise\nfinally:\n    if _server is not None:\n        _server.close()\n
+    \   debug_sleep = int(os.environ.get(\"WEKA_OPERATOR_DEBUG_SLEEP\", 3))\n    logging.info(f\"{debug_sleep}
+    seconds exit-sleep to allow for debugging and ensure proper sync\")\n    start
+    = time.time()\n    while time.time() - start < debug_sleep:\n        if os.path.exists(\"/tmp/.cancel-debug-sleep\"):\n
+    \           break\n        time.sleep(1)\n"
+kind: ConfigMap
+metadata:
+  name: weka-boot-scripts
